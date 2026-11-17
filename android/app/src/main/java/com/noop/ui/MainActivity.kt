@@ -1143,6 +1143,7 @@ fun NoopRoot() {
             }
         } else {
             WhoopStyleHomeScreen(
+                appViewModel = appViewModel,
                 onOpenMetricDetail = { target ->
                     if (target == "BLE_SETTINGS") {
                         showStockBleUtility = true

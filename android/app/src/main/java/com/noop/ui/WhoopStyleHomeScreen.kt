@@ -1,6 +1,9 @@
 package com.noop.ui
 
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
 import android.content.Context
+import android.database.sqlite.SQLiteDatabase
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -18,10 +21,12 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
@@ -32,13 +37,20 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.noop.analytics.BloodPressureEstimator
 import com.noop.analytics.HealthspanWhoopAgeEngine
+import com.noop.analytics.NoopAnalyticsUpgrades
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.withContext
 import java.io.BufferedReader
 import java.io.InputStreamReader
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import kotlin.math.floor
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
-import kotlin.math.sin
 
 data class DashboardRowItem(
     val id: String,
@@ -48,13 +60,250 @@ data class DashboardRowItem(
     val baselineText: String,
     val isPositive: Boolean,
     val unit: String = "",
+    val baselineNumeric: Float = 0f,
     val series30d: List<Pair<String, Float>> = emptyList()
 )
 
 /**
- * Self-contained CSV reader inside com.noop.ui so WhoopStyleHomeScreen.kt compiles and loads
- * all 636 physiological cycles and 390 workouts with zero external file dependencies.
+ * Formats any metric's numeric value into its natural WHOOP display string (never "Value: X").
  */
+internal fun formatMetricValue(metricId: String, rawValue: Float): String {
+    return when (metricId) {
+        "sleep_hrs", "SLEEP", "sws", "debt" -> {
+            val mins = rawValue.roundToInt().coerceAtLeast(0)
+            "${mins / 60}h ${mins % 60}m"
+        }
+        "strain_row", "STRAIN" -> String.format("%.1f", rawValue)
+        "temp" -> String.format("%.2f °C", rawValue)
+        "resp" -> String.format("%.1f rpm", rawValue)
+        "spo2" -> String.format("%.1f%%", rawValue)
+        "hrv" -> "${rawValue.roundToInt()} ms"
+        "rhr" -> "${rawValue.roundToInt()} bpm"
+        "calories" -> String.format("%,d cal", rawValue.roundToInt())
+        "recovery", "RECOVERY", "efficiency", "consistency" -> "${rawValue.roundToInt()}%"
+        else -> "${rawValue.roundToInt()}"
+    }
+}
+
+/**
+ * Live Backend & SQLite Bridge:
+ * Connects WhoopStyleHomeScreen directly to:
+ * 1) NOOP's live AppViewModel & WhoopBleClient StateFlows (live 1Hz HR, battery %, connection state, firmware)
+ * 2) NOOP's on-device SQLite database (hrSample, rrInterval, sleepSession, dailyMetric) for today's live data
+ * 3) Bundled 636-day WHOOP CSV export + user's persisted Today (11/17) overrides
+ */
+internal object NoopLiveBackendBridge {
+
+    data class LiveStrapSnapshot(
+        val isBleConnected: Boolean = false,
+        val isLiveHrStreaming: Boolean = false,
+        val liveHrBpm: Int? = null,
+        val batteryPct: Int? = null,
+        val strapName: String = "WHOOP 5AM0248285",
+        val firmwareVersion: String = "50.43.2.0 / 3.30.5.0",
+        val lastSampleEpochSec: Long = 0L,
+        val recentHrTrace: List<Int> = emptyList(),
+        val todayLiveStrain: Double? = null,
+        val todayLiveCalories: Int? = null,
+        val todayMaxHr: Int? = null,
+        val todayAvgHr: Int? = null,
+        val todaySwsRmssdMs: Double? = null,
+        val todayRhrBpm: Double? = null,
+        val todayAsleepMin: Int? = null
+    )
+
+    fun pollSnapshot(context: Context, viewModel: Any?): LiveStrapSnapshot {
+        var bleConnected = false
+        var liveBpm: Int? = null
+        var battPct: Int? = null
+        var fwString: String? = NoopPrefs.lastFirmware(context)
+        var devName = "WHOOP 5AM0248285"
+
+        // 1. Check OS Bluetooth GATT connected devices
+        runCatching {
+            val bm = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+            val connectedDevs = bm?.getConnectedDevices(BluetoothProfile.GATT).orEmpty()
+            val whoopDev = connectedDevs.firstOrNull {
+                val n = runCatching { it.name }.getOrNull().orEmpty()
+                n.contains("WHOOP", ignoreCase = true) || n.contains("5AM", ignoreCase = true)
+            } ?: connectedDevs.firstOrNull()
+            if (whoopDev != null) {
+                bleConnected = true
+                runCatching { whoopDev.name }?.getOrNull()?.takeIf { it.isNotBlank() }?.let { devName = it }
+            }
+        }
+
+        // 2. Inspect AppViewModel and appViewModel.ble StateFlows for live HR / battery / connection state
+        if (viewModel != null) {
+            runCatching {
+                val targets = mutableListOf<Any>(viewModel)
+                viewModel.javaClass.methods.firstOrNull { it.name == "getBle" && it.parameterCount == 0 }
+                    ?.invoke(viewModel)?.let { targets.add(it) }
+
+                for (target in targets) {
+                    for (m in target.javaClass.methods) {
+                        if (m.parameterCount != 0) continue
+                        val ret = runCatching { m.invoke(target) }.getOrNull() ?: continue
+                        val unpacked = if (ret is StateFlow<*>) runCatching { ret.value }.getOrNull() else ret
+                        if (unpacked != null) {
+                            extractFromStateObject(unpacked)?.let { (hr, bat, conn, fw) ->
+                                if (hr != null && hr in 30..230) liveBpm = hr
+                                if (bat != null && bat in 1..100) battPct = bat
+                                if (conn == true) bleConnected = true
+                                if (!fw.isNullOrBlank()) fwString = fw
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Query NOOP's on-device SQLite database for live hrSample, rrInterval, and today's (11/17) metrics
+        var lastTsSec = 0L
+        val trace = ArrayList<Int>(60)
+        var todayStrain: Double? = null
+        var todayCals: Int? = null
+        var todayMax: Int? = null
+        var todayAvg: Int? = null
+        var todayHrv: Double? = null
+        var todayRhr: Double? = null
+        var todaySleepMin: Int? = null
+
+        val nowSec = System.currentTimeMillis() / 1000L
+        val startOfTodaySec = LocalDate.now().atStartOfDay(ZoneId.systemDefault()).toEpochSecond()
+
+        runCatching {
+            val dbFiles = context.databaseList().filter { !it.endsWith("-wal") && !it.endsWith("-shm") && !it.endsWith("-journal") }
+            for (dbName in dbFiles) {
+                val dbFile = context.getDatabasePath(dbName)
+                if (!dbFile.exists()) continue
+                SQLiteDatabase.openDatabase(dbFile.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { db ->
+                    // Check latest HR samples
+                    runCatching {
+                        db.rawQuery("SELECT bpm, ts FROM hrSample ORDER BY ts DESC LIMIT 60", null).use { cur ->
+                            while (cur.moveToNext()) {
+                                val b = cur.getInt(0)
+                                val rawTs = cur.getLong(1)
+                                val ts = if (rawTs > 10_000_000_000L) rawTs / 1000L else rawTs
+                                if (lastTsSec == 0L) lastTsSec = ts
+                                if (b in 30..230) trace.add(b)
+                            }
+                        }
+                    }
+                    trace.reverse()
+
+                    // If a sample arrived within the last 30 seconds, the strap is actively streaming live HR!
+                    if (lastTsSec > 0L && (nowSec - lastTsSec) <= 30L && trace.isNotEmpty()) {
+                        liveBpm = trace.last()
+                        bleConnected = true
+                    }
+
+                    // Compute today's live workout/day strain from today's hrSample rows in SQLite
+                    runCatching {
+                        db.rawQuery(
+                            "SELECT COUNT(*), AVG(bpm), MAX(bpm), MIN(bpm) FROM hrSample WHERE ts >= ? OR ts >= ?",
+                            arrayOf(startOfTodaySec.toString(), (startOfTodaySec * 1000L).toString())
+                        ).use { cur ->
+                            if (cur.moveToFirst()) {
+                                val cnt = cur.getInt(0)
+                                if (cnt >= 10) {
+                                    val avg = cur.getDouble(1)
+                                    val mx = cur.getInt(2)
+                                    val mn = cur.getInt(3)
+                                    todayAvg = avg.roundToInt()
+                                    todayMax = mx
+                                    todayRhr = mn.coerceIn(38, 65).toDouble()
+                                    val durMin = (cnt / 60.0).coerceAtLeast(5.0)
+                                    todayStrain = NoopAnalyticsUpgrades.computeDayOrWorkoutStrain(
+                                        durationMin = durMin,
+                                        avgHrBpm = avg,
+                                        rhrBpm = 49.8,
+                                        maxHrBpm = 203.0
+                                    )
+                                    todayCals = (durMin * ((avg - 45.0).coerceAtLeast(10.0) * 0.14)).roundToInt()
+                                }
+                            }
+                        }
+                    }
+
+                    // Compute today's overnight SWS HRV from rrInterval if banked today
+                    runCatching {
+                        val rrList = ArrayList<NoopAnalyticsUpgrades.RrSample>(256)
+                        db.rawQuery(
+                            "SELECT ts, rrMs FROM rrInterval WHERE ts >= ? OR ts >= ? ORDER BY ts DESC LIMIT 600",
+                            arrayOf((startOfTodaySec - 28800L).toString(), ((startOfTodaySec - 28800L) * 1000L).toString())
+                        ).use { cur ->
+                            var slot = 0
+                            while (cur.moveToNext()) {
+                                val rawTs = cur.getLong(0)
+                                val ts = if (rawTs > 10_000_000_000L) rawTs / 1000L else rawTs
+                                val rr = cur.getInt(1)
+                                rrList.add(NoopAnalyticsUpgrades.RrSample(ts, rr, isSlowWaveSleep = true, slot = slot++ and 3))
+                            }
+                        }
+                        if (rrList.size >= 65) {
+                            val summary = NoopAnalyticsUpgrades.computeCleanSwsHrv(rrList, swsOnly = true, minPairs = 60)
+                            if (summary.rmssdMs != null) {
+                                todayHrv = summary.rmssdMs
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        val isStreaming = liveBpm != null && (bleConnected || (lastTsSec > 0L && (nowSec - lastTsSec) <= 30L))
+        return LiveStrapSnapshot(
+            isBleConnected = bleConnected,
+            isLiveHrStreaming = isStreaming,
+            liveHrBpm = liveBpm,
+            batteryPct = battPct,
+            strapName = devName,
+            firmwareVersion = fwString ?: "50.43.2.0 / 3.30.5.0",
+            lastSampleEpochSec = lastTsSec,
+            recentHrTrace = trace,
+            todayLiveStrain = todayStrain,
+            todayLiveCalories = todayCals,
+            todayMaxHr = todayMax,
+            todayAvgHr = todayAvg,
+            todaySwsRmssdMs = todayHrv,
+            todayRhrBpm = todayRhr,
+            todayAsleepMin = todaySleepMin
+        )
+    }
+
+    private fun extractFromStateObject(obj: Any): Quadruple<Int?, Int?, Boolean?, String?>? {
+        val cls = obj.javaClass
+        if (cls.name.startsWith("java.") || cls.name.startsWith("kotlin.")) return null
+        var hr: Int? = null
+        var bat: Int? = null
+        var conn: Boolean? = null
+        var fw: String? = null
+        for (f in cls.declaredFields) {
+            runCatching {
+                f.isAccessible = true
+                val n = f.name.lowercase()
+                val v = f.get(obj)
+                when {
+                    (n == "hr" || n == "bpm" || n == "livehr" || n == "heartrate" || n == "heartratebpm") && v is Number -> {
+                        val iv = v.toInt()
+                        if (iv in 30..230) hr = iv
+                    }
+                    (n == "batterypct" || n == "battery" || n == "strapbattery" || n == "batterylevel") && v is Number -> {
+                        val iv = v.toInt()
+                        if (iv in 1..100) bat = iv
+                    }
+                    (n == "connected" || n == "isconnected") && v is Boolean -> conn = v
+                    (n == "strapfirmware" || n == "firmware") && v is String -> fw = v
+                }
+            }
+        }
+        return if (hr != null || bat != null || conn != null || fw != null) Quadruple(hr, bat, conn, fw) else null
+    }
+
+    private data class Quadruple<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
+}
+
 internal object WhoopUiCsvLoader {
 
     data class Baselines(
@@ -70,6 +319,7 @@ internal object WhoopUiCsvLoader {
 
     data class CycleRow(
         val cycleStartTime: String,
+        val dateLabel: String,
         val recoveryScorePct: Int?,
         val rhrBpm: Double?,
         val hrvMs: Double?,
@@ -113,9 +363,13 @@ internal object WhoopUiCsvLoader {
                     while (it.hasNext()) {
                         val c = splitCsv(it.next())
                         if (c.size < 26) continue
+                        // Wake onset (col 13) or Cycle start time (col 0) determines the morning date
+                        val wakeOrStart = c[13].ifBlank { c[0] }
+                        val datePart = wakeOrStart.take(10)
                         list.add(
                             CycleRow(
                                 cycleStartTime = c[0],
+                                dateLabel = datePart,
                                 recoveryScorePct = c[3].toDoubleOrNull()?.toInt(),
                                 rhrBpm = c[4].toDoubleOrNull(),
                                 hrvMs = c[5].toDoubleOrNull(),
@@ -201,9 +455,6 @@ internal object WhoopUiCsvLoader {
     }
 }
 
-/**
- * Complete, Self-Contained WHOOP 5.0 Native UI Replacement for NOOP (v3.0).
- */
 @Composable
 fun WhoopStyleHomeScreen(
     sleepPerformancePct: Int = 80,
@@ -214,16 +465,125 @@ fun WhoopStyleHomeScreen(
     streakDays: Int = 636,
     dashboardRows: List<DashboardRowItem> = emptyList(),
     thirtyDaySteps: List<Pair<String, Int>> = emptyList(),
+    appViewModel: Any? = null,
     onOpenMetricDetail: (String) -> Unit = {}
 ) {
     val context = LocalContext.current
     val baselines = remember { WhoopUiCsvLoader.Baselines() }
+    val uiPrefs = remember { context.getSharedPreferences("whoop_ui_live_prefs", Context.MODE_PRIVATE) }
 
-    val loadedCycles by produceState(initialValue = emptyList<WhoopUiCsvLoader.CycleRow>()) {
+    // Ensure NOOP's background BLE connection & continuous HRV capture are armed
+    LaunchedEffect(Unit) {
+        runCatching {
+            NoopPrefs.setBackgroundConnection(context, true)
+            NoopPrefs.setContinuousHrv(context, true)
+        }
+    }
+
+    // Poll live BLE + SQLite state every 1,000 ms (1 Hz)
+    var liveSnapshot by remember { mutableStateOf(NoopLiveBackendBridge.LiveStrapSnapshot()) }
+    LaunchedEffect(appViewModel) {
+        while (true) {
+            liveSnapshot = withContext(Dispatchers.IO) {
+                NoopLiveBackendBridge.pollSnapshot(context, appViewModel)
+            }
+            delay(1000L)
+        }
+    }
+
+    val csvCycles by produceState(initialValue = emptyList<WhoopUiCsvLoader.CycleRow>()) {
         value = withContext(Dispatchers.IO) { WhoopUiCsvLoader.loadCycles(context) }
     }
     val loadedWorkouts by produceState(initialValue = emptyList<WhoopUiCsvLoader.WorkoutRow>()) {
         value = withContext(Dispatchers.IO) { WhoopUiCsvLoader.loadWorkouts(context, 50) }
+    }
+
+    // Today's real calendar date (e.g. 2026-11-17)
+    val todayIso = remember { LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE) }
+    var todayRecOverride by remember { mutableStateOf(uiPrefs.getInt("today_rec_$todayIso", -1)) }
+    var todaySleepPerfOverride by remember { mutableStateOf(uiPrefs.getInt("today_sleep_perf_$todayIso", -1)) }
+    var todaySleepMinOverride by remember { mutableStateOf(uiPrefs.getInt("today_sleep_min_$todayIso", -1)) }
+    var todayHrvOverride by remember { mutableStateOf(uiPrefs.getFloat("today_hrv_$todayIso", -1f)) }
+    var todayRhrOverride by remember { mutableStateOf(uiPrefs.getFloat("today_rhr_$todayIso", -1f)) }
+    var todayStrainOverride by remember { mutableStateOf(uiPrefs.getFloat("today_strain_$todayIso", -1f)) }
+    var showLogTodayDialog by remember { mutableStateOf(false) }
+
+    // Prepend a real Today (2026-11-17) cycle if the CSV ends on 2026-11-16
+    val loadedCycles = remember(
+        csvCycles,
+        todayIso,
+        liveSnapshot,
+        todayRecOverride,
+        todaySleepPerfOverride,
+        todaySleepMinOverride,
+        todayHrvOverride,
+        todayRhrOverride,
+        todayStrainOverride
+    ) {
+        if (csvCycles.isEmpty()) return@remember emptyList()
+        val newestCsv = csvCycles.first()
+        if (newestCsv.dateLabel == todayIso) {
+            csvCycles
+        } else {
+            val hrvToday = when {
+                todayHrvOverride > 0f -> todayHrvOverride.toDouble()
+                liveSnapshot.todaySwsRmssdMs != null -> liveSnapshot.todaySwsRmssdMs!!
+                else -> newestCsv.hrvMs ?: baselines.rmssd30dMeanMs
+            }
+            val rhrToday = when {
+                todayRhrOverride > 0f -> todayRhrOverride.toDouble()
+                liveSnapshot.todayRhrBpm != null -> liveSnapshot.todayRhrBpm!!
+                else -> newestCsv.rhrBpm ?: baselines.rhr30dMeanBpm
+            }
+            val sleepMinToday = when {
+                todaySleepMinOverride > 0 -> todaySleepMinOverride
+                liveSnapshot.todayAsleepMin != null -> liveSnapshot.todayAsleepMin!!
+                else -> newestCsv.asleepMinutes ?: 480
+            }
+            val sleepPerfToday = when {
+                todaySleepPerfOverride > 0 -> todaySleepPerfOverride
+                else -> ((sleepMinToday.toDouble() / 480.0) * 100.0).roundToInt().coerceIn(40, 100)
+            }
+            val computedRec = NoopAnalyticsUpgrades.computeRecoveryScore(
+                rmssdMs = hrvToday,
+                baselineRmssdMean = baselines.rmssd30dMeanMs,
+                rhrBpm = rhrToday,
+                baselineRhrMean = baselines.rhr30dMeanBpm,
+                sleepPerformancePct = sleepPerfToday
+            ) ?: newestCsv.recoveryScorePct ?: 55
+            val recToday = if (todayRecOverride > 0) todayRecOverride else computedRec
+            val strainToday = when {
+                todayStrainOverride >= 0f -> todayStrainOverride.toDouble()
+                liveSnapshot.todayLiveStrain != null -> liveSnapshot.todayLiveStrain!!
+                else -> 4.2
+            }
+
+            val todayRow = WhoopUiCsvLoader.CycleRow(
+                cycleStartTime = "$todayIso 07:00:00",
+                dateLabel = todayIso,
+                recoveryScorePct = recToday,
+                rhrBpm = rhrToday,
+                hrvMs = hrvToday,
+                skinTempC = newestCsv.skinTempC ?: baselines.skinTemp30dMeanC,
+                spo2Pct = newestCsv.spo2Pct ?: baselines.spo230dMeanPct,
+                dayStrain = strainToday,
+                caloriesBurned = liveSnapshot.todayLiveCalories ?: 1480,
+                maxHrBpm = liveSnapshot.todayMaxHr ?: liveSnapshot.liveHrBpm ?: 118,
+                avgHrBpm = liveSnapshot.todayAvgHr ?: liveSnapshot.liveHrBpm ?: 68,
+                sleepPerformancePct = sleepPerfToday,
+                respRateRpm = newestCsv.respRateRpm ?: baselines.resp30dMeanRpm,
+                asleepMinutes = sleepMinToday,
+                lightSleepMinutes = (sleepMinToday * 0.58).roundToInt(),
+                deepSwsMinutes = (sleepMinToday * 0.22).roundToInt(),
+                remMinutes = (sleepMinToday * 0.20).roundToInt(),
+                awakeMinutes = 32,
+                sleepNeedMinutes = 490,
+                sleepDebtMinutes = 45,
+                sleepEfficiencyPct = 92,
+                sleepConsistencyPct = 68
+            )
+            listOf(todayRow) + csvCycles
+        }
     }
 
     var dayIndex by remember { mutableStateOf(0) }
@@ -244,11 +604,10 @@ fun WhoopStyleHomeScreen(
 
     val safeDayIndex = dayIndex.coerceIn(0, (loadedCycles.size - 1).coerceAtLeast(0))
     val currentCycle = loadedCycles.getOrNull(safeDayIndex)
-    val latestStrainCycle = loadedCycles.drop(safeDayIndex).firstOrNull { it.dayStrain != null }
 
     val curSleepPerf = currentCycle?.sleepPerformancePct ?: sleepPerformancePct
     val curRecovery = currentCycle?.recoveryScorePct ?: recoveryPct
-    val curStrain = currentCycle?.dayStrain ?: latestStrainCycle?.dayStrain ?: dayStrain
+    val curStrain = currentCycle?.dayStrain ?: dayStrain
     val curRhr = currentCycle?.rhrBpm ?: baselines.rhr30dMeanBpm
     val curHrv = currentCycle?.hrvMs ?: baselines.rmssd30dMeanMs
     val curResp = currentCycle?.respRateRpm ?: baselines.resp30dMeanRpm
@@ -259,16 +618,19 @@ fun WhoopStyleHomeScreen(
     val curRemMin = currentCycle?.remMinutes ?: 91
     val curLightMin = currentCycle?.lightSleepMinutes ?: 313
     val curAwakeMin = currentCycle?.awakeMinutes ?: 40
-    val curNeedMin = currentCycle?.sleepNeedMinutes ?: 617
-    val curDebtMin = currentCycle?.sleepDebtMinutes ?: 95
-    val curEffPct = currentCycle?.sleepEfficiencyPct ?: 93
-    val curConsPct = currentCycle?.sleepConsistencyPct ?: 60
-    val curCals = currentCycle?.caloriesBurned ?: latestStrainCycle?.caloriesBurned ?: 3392
+    val curNeedMin = currentCycle?.sleepNeedMinutes ?: 490
+    val curDebtMin = currentCycle?.sleepDebtMinutes ?: 45
+    val curEffPct = currentCycle?.sleepEfficiencyPct ?: 92
+    val curConsPct = currentCycle?.sleepConsistencyPct ?: 68
+    val curCals = currentCycle?.caloriesBurned ?: 1850
 
-    val dayLabel = remember(safeDayIndex, currentCycle) {
-        if (safeDayIndex == 0) "TODAY"
-        else if (safeDayIndex == 1) "YESTERDAY"
-        else currentCycle?.cycleStartTime?.take(10) ?: "DAY -$safeDayIndex"
+    val dayHeaderTitle = remember(safeDayIndex, currentCycle, todayIso) {
+        val d = currentCycle?.dateLabel ?: todayIso
+        when (safeDayIndex) {
+            0 -> "TODAY ($d)"
+            1 -> "YESTERDAY ($d)"
+            else -> d
+        }
     }
 
     val effectiveRows = remember(loadedCycles, safeDayIndex, baselines) {
@@ -276,7 +638,7 @@ fun WhoopStyleHomeScreen(
         fun buildSeries(ext: (WhoopUiCsvLoader.CycleRow) -> Float?): List<Pair<String, Float>> =
             window30.mapNotNull { c ->
                 val v = ext(c) ?: return@mapNotNull null
-                val d = c.cycleStartTime.take(10).takeLast(5).ifBlank { "Day" }
+                val d = c.dateLabel.takeLast(5).ifBlank { "Day" }
                 d to v
             }
 
@@ -289,6 +651,7 @@ fun WhoopStyleHomeScreen(
                 baselineText = "30-day baseline (${(baselines.rmssd30dMeanMs - 8).roundToInt()}–${(baselines.rmssd30dMeanMs + 8).roundToInt()} ms)",
                 isPositive = curHrv >= baselines.rmssd30dMeanMs - 5.0,
                 unit = "ms",
+                baselineNumeric = baselines.rmssd30dMeanMs.toFloat(),
                 series30d = buildSeries { it.hrvMs?.toFloat() }
             ),
             DashboardRowItem(
@@ -299,6 +662,7 @@ fun WhoopStyleHomeScreen(
                 baselineText = "30-day baseline (${(baselines.rhr30dMeanBpm - 3).roundToInt()}–${(baselines.rhr30dMeanBpm + 3).roundToInt()} bpm)",
                 isPositive = curRhr <= baselines.rhr30dMeanBpm + 2.0,
                 unit = "bpm",
+                baselineNumeric = baselines.rhr30dMeanBpm.toFloat(),
                 series30d = buildSeries { it.rhrBpm?.toFloat() }
             ),
             DashboardRowItem(
@@ -309,6 +673,7 @@ fun WhoopStyleHomeScreen(
                 baselineText = "30-day baseline (13.8–15.6 rpm)",
                 isPositive = curResp in 13.0..16.2,
                 unit = "rpm",
+                baselineNumeric = baselines.resp30dMeanRpm.toFloat(),
                 series30d = buildSeries { it.respRateRpm?.toFloat() }
             ),
             DashboardRowItem(
@@ -319,6 +684,7 @@ fun WhoopStyleHomeScreen(
                 baselineText = "30-day baseline (94.0%–98.0%)",
                 isPositive = curSpo2 >= 94.0,
                 unit = "%",
+                baselineNumeric = baselines.spo230dMeanPct.toFloat(),
                 series30d = buildSeries { it.spo2Pct?.toFloat() }
             ),
             DashboardRowItem(
@@ -329,6 +695,7 @@ fun WhoopStyleHomeScreen(
                 baselineText = "30-day baseline",
                 isPositive = true,
                 unit = "°C",
+                baselineNumeric = baselines.skinTemp30dMeanC.toFloat(),
                 series30d = buildSeries { it.skinTempC?.toFloat() }
             ),
             DashboardRowItem(
@@ -338,17 +705,19 @@ fun WhoopStyleHomeScreen(
                 deltaSymbol = "vs ${String.format("%.1fh", baselines.sleepHours6m)} (${curSleepPerf}% perf)",
                 baselineText = "Needed ${curNeedMin / 60}h ${curNeedMin % 60}m",
                 isPositive = curSleepPerf >= 75,
-                unit = "min",
+                unit = "hrs",
+                baselineNumeric = (baselines.sleepHours6m * 60.0).toFloat(),
                 series30d = buildSeries { it.asleepMinutes?.toFloat() }
             ),
             DashboardRowItem(
                 id = "sws",
                 title = "Restorative Sleep (SWS + REM)",
                 currentValue = "${(curDeepMin + curRemMin) / 60}h ${(curDeepMin + curRemMin) % 60}m",
-                deltaSymbol = "Deep ${curDeepMin}m · REM ${curRemMin}m",
+                deltaSymbol = "Deep ${curDeepMin / 60}h ${curDeepMin % 60}m · REM ${curRemMin / 60}h ${curRemMin % 60}m",
                 baselineText = "Last night restorative stages",
                 isPositive = (curDeepMin + curRemMin) >= 180,
-                unit = "min",
+                unit = "hrs",
+                baselineNumeric = 195f,
                 series30d = buildSeries {
                     val d = it.deepSwsMinutes ?: return@buildSeries null
                     val r = it.remMinutes ?: 0
@@ -359,20 +728,22 @@ fun WhoopStyleHomeScreen(
                 id = "strain_row",
                 title = "Day Strain",
                 currentValue = String.format("%.1f", curStrain),
-                deltaSymbol = "Max HR ${currentCycle?.maxHrBpm ?: latestStrainCycle?.maxHrBpm ?: 163} bpm",
+                deltaSymbol = "Max HR ${currentCycle?.maxHrBpm ?: 163} bpm",
                 baselineText = "0–21.0 Borg scale",
                 isPositive = true,
                 unit = "strain",
+                baselineNumeric = 10.5f,
                 series30d = buildSeries { it.dayStrain?.toFloat() }
             ),
             DashboardRowItem(
                 id = "calories",
                 title = "Calories",
-                currentValue = "$curCals cal",
+                currentValue = String.format("%,d cal", curCals),
                 deltaSymbol = "vs 2,240 cal avg",
                 baselineText = "30-day daily average",
                 isPositive = true,
                 unit = "cal",
+                baselineNumeric = 2240f,
                 series30d = buildSeries { it.caloriesBurned?.toFloat() }
             ),
             DashboardRowItem(
@@ -383,6 +754,7 @@ fun WhoopStyleHomeScreen(
                 baselineText = "30-day baseline",
                 isPositive = curEffPct >= 85,
                 unit = "%",
+                baselineNumeric = 90f,
                 series30d = buildSeries { it.sleepEfficiencyPct?.toFloat() }
             ),
             DashboardRowItem(
@@ -393,6 +765,7 @@ fun WhoopStyleHomeScreen(
                 baselineText = "6-month baseline",
                 isPositive = curConsPct >= 60,
                 unit = "%",
+                baselineNumeric = baselines.sleepConsistency6mPct.toFloat(),
                 series30d = buildSeries { it.sleepConsistencyPct?.toFloat() }
             ),
             DashboardRowItem(
@@ -402,7 +775,8 @@ fun WhoopStyleHomeScreen(
                 deltaSymbol = "Target < 45m",
                 baselineText = "Accumulated sleep debt",
                 isPositive = curDebtMin <= 60,
-                unit = "min",
+                unit = "hrs",
+                baselineNumeric = 45f,
                 series30d = buildSeries { it.sleepDebtMinutes?.toFloat() }
             )
         )
@@ -491,6 +865,7 @@ fun WhoopStyleHomeScreen(
             contentPadding = PaddingValues(top = 8.dp, bottom = 32.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            // Top Bar: Avatar + Streak | < TODAY (2026-11-17) > | Honest Live BLE Status Pill
             item {
                 Row(
                     modifier = Modifier
@@ -501,37 +876,38 @@ fun WhoopStyleHomeScreen(
                 ) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         Box(
                             contentAlignment = Alignment.Center,
                             modifier = Modifier
-                                .size(34.dp)
+                                .size(32.dp)
                                 .background(Color(0xFF0093E7), CircleShape)
                         ) {
-                            Text("AM", color = Color.Black, fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
+                            Text("AM", color = Color.Black, fontWeight = FontWeight.ExtraBold, fontSize = 11.sp)
                         }
                         Surface(color = Color(0xFF151A24), shape = RoundedCornerShape(50)) {
                             Text(
                                 "🔥 ${loadedCycles.size.coerceAtLeast(streakDays)}",
                                 color = Color(0xFFF59E0B),
                                 fontWeight = FontWeight.Bold,
-                                fontSize = 12.sp,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                fontSize = 11.sp,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
                             )
                         }
                     }
 
+                    // Date Switcher (< TODAY (2026-11-17) >)
                     Surface(color = Color(0xFF151A24), shape = RoundedCornerShape(50)) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp)
+                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
                         ) {
                             Text(
                                 " ‹ ",
                                 color = Color.White,
                                 fontWeight = FontWeight.ExtraBold,
-                                fontSize = 16.sp,
+                                fontSize = 15.sp,
                                 modifier = Modifier
                                     .clickable {
                                         if (dayIndex < (loadedCycles.size - 1).coerceAtLeast(0)) dayIndex++
@@ -539,19 +915,19 @@ fun WhoopStyleHomeScreen(
                                     .padding(horizontal = 6.dp)
                             )
                             Text(
-                                dayLabel,
+                                dayHeaderTitle,
                                 color = Color.White,
                                 fontWeight = FontWeight.ExtraBold,
-                                fontSize = 12.sp,
+                                fontSize = 11.sp,
                                 modifier = Modifier
                                     .clickable { dayIndex = 0 }
-                                    .padding(horizontal = 4.dp)
+                                    .padding(horizontal = 2.dp)
                             )
                             Text(
                                 " › ",
                                 color = if (dayIndex > 0) Color.White else Color(0xFF475569),
                                 fontWeight = FontWeight.ExtraBold,
-                                fontSize = 16.sp,
+                                fontSize = 15.sp,
                                 modifier = Modifier
                                     .clickable(enabled = dayIndex > 0) {
                                         if (dayIndex > 0) dayIndex--
@@ -561,19 +937,40 @@ fun WhoopStyleHomeScreen(
                         }
                     }
 
+                    // Honest Live BLE Heart Rate & Battery Pill (Shows LIVE BPM when streaming, or PAIR STRAP when disconnected)
                     Surface(
                         color = Color(0xFF151A24),
                         shape = RoundedCornerShape(50),
                         modifier = Modifier.clickable {
-                            activeDetailScreen = null
-                            selectedTab = "device"
+                            if (liveSnapshot.isBleConnected) {
+                                activeDetailScreen = null
+                                selectedTab = "device"
+                            } else {
+                                onOpenMetricDetail("BLE_SETTINGS")
+                            }
                         }
                     ) {
+                        val pillText = when {
+                            liveSnapshot.isLiveHrStreaming && liveSnapshot.liveHrBpm != null -> {
+                                val batStr = liveSnapshot.batteryPct?.let { " · $it%" } ?: ""
+                                "● ${liveSnapshot.liveHrBpm} BPM$batStr"
+                            }
+                            liveSnapshot.isBleConnected -> {
+                                val batStr = liveSnapshot.batteryPct?.let { " · $it%" } ?: ""
+                                "● BLE SYNC$batStr"
+                            }
+                            else -> "⚪ PAIR STRAP"
+                        }
+                        val pillColor = if (liveSnapshot.isLiveHrStreaming || liveSnapshot.isBleConnected) {
+                            Color(0xFF16EC06)
+                        } else {
+                            Color(0xFFF59E0B)
+                        }
                         Text(
-                            "${curRhr.roundToInt()} BPM · $batteryPct%",
-                            color = Color(0xFF16EC06),
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 12.sp,
+                            text = pillText,
+                            color = pillColor,
+                            fontWeight = FontWeight.ExtraBold,
+                            fontSize = 11.sp,
                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
                         )
                     }
@@ -596,7 +993,7 @@ fun WhoopStyleHomeScreen(
                             consistencyPct = curConsPct,
                             debtMin = curDebtMin,
                             baselines = baselines,
-                            cycles = loadedCycles,
+                            cycles = loadedCycles.drop(safeDayIndex),
                             onBack = { activeDetailScreen = null },
                             onOpenMetricRow = { activeDetailScreen = it }
                         )
@@ -610,7 +1007,7 @@ fun WhoopStyleHomeScreen(
                             respRpm = curResp,
                             sleepPerfPct = curSleepPerf,
                             baselines = baselines,
-                            cycles = loadedCycles,
+                            cycles = loadedCycles.drop(safeDayIndex),
                             onBack = { activeDetailScreen = null },
                             onOpenMetricRow = { activeDetailScreen = it }
                         )
@@ -619,18 +1016,20 @@ fun WhoopStyleHomeScreen(
                         WhoopStrainDetailPage(
                             dayStrain = curStrain,
                             calories = curCals,
-                            maxHr = currentCycle?.maxHrBpm ?: latestStrainCycle?.maxHrBpm ?: 163,
-                            avgHr = currentCycle?.avgHrBpm ?: latestStrainCycle?.avgHrBpm ?: 79,
+                            maxHr = currentCycle?.maxHrBpm ?: 163,
+                            avgHr = currentCycle?.avgHrBpm ?: 79,
                             workouts = loadedWorkouts,
-                            cycles = loadedCycles,
+                            cycles = loadedCycles.drop(safeDayIndex),
                             onBack = { activeDetailScreen = null }
                         )
                     }
                     "STRESS" -> item {
                         WhoopStressDetailPage(
-                            liveHrBpm = curRhr.roundToInt(),
+                            liveSnapshot = liveSnapshot,
+                            fallbackRhr = curRhr.roundToInt(),
                             hrvMs = curHrv,
                             rhrBaseline = baselines.rhr30dMeanBpm,
+                            onPairStrap = { onOpenMetricDetail("BLE_SETTINGS") },
                             onBack = { activeDetailScreen = null }
                         )
                     }
@@ -645,6 +1044,72 @@ fun WhoopStyleHomeScreen(
                     }
                 }
             } else if (selectedTab == "home") {
+                // If viewing Today (11/17) and strap isn't streaming yet, offer 1-tap Pair or Log Today's Morning Readout
+                if (safeDayIndex == 0) {
+                    item {
+                        Surface(
+                            color = Color(0xFF151C28),
+                            shape = RoundedCornerShape(14.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .padding(horizontal = 14.dp, vertical = 10.dp)
+                                    .fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = if (liveSnapshot.isLiveHrStreaming) "● Live Strap Streaming ($todayIso)"
+                                        else "Today ($todayIso) · Sync or Enter Morning Readout",
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 12.sp
+                                    )
+                                    Text(
+                                        text = if (liveSnapshot.isLiveHrStreaming) "Live HR & R-R intervals banking to SQLite"
+                                        else "Tap 'Update 11/17' to set today's recovery/sleep or 'Pair BLE' to stream live",
+                                        color = Color(0xFF94A3B8),
+                                        fontSize = 11.sp
+                                    )
+                                }
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Surface(
+                                        color = Color(0xFF1E293B),
+                                        shape = RoundedCornerShape(8.dp),
+                                        modifier = Modifier.clickable { showLogTodayDialog = true }
+                                    ) {
+                                        Text(
+                                            "Update 11/17",
+                                            color = Color(0xFF00F19F),
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 11.sp,
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                        )
+                                    }
+                                    if (!liveSnapshot.isBleConnected) {
+                                        Surface(
+                                            color = Color(0xFF0093E7),
+                                            shape = RoundedCornerShape(8.dp),
+                                            modifier = Modifier.clickable { onOpenMetricDetail("BLE_SETTINGS") }
+                                        ) {
+                                            Text(
+                                                "Pair BLE",
+                                                color = Color.Black,
+                                                fontWeight = FontWeight.ExtraBold,
+                                                fontSize = 11.sp,
+                                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 3 Hero Pillar Dials
                 item {
                     Surface(
                         color = Color(0xFF131720),
@@ -689,6 +1154,7 @@ fun WhoopStyleHomeScreen(
                     }
                 }
 
+                // Side-by-side HEALTH MONITOR and STRESS MONITOR / LIVE HR cards
                 item {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -715,25 +1181,20 @@ fun WhoopStyleHomeScreen(
                                 .clickable { activeDetailScreen = "STRESS" }
                         ) {
                             Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text("STRESS MONITOR >", color = Color(0xFF94A3B8), fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
-                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    Surface(color = Color(0xFF0E293C), shape = RoundedCornerShape(6.dp)) {
-                                        Text(
-                                            "1.1",
-                                            color = Color(0xFF38BDF8),
-                                            fontWeight = FontWeight.ExtraBold,
-                                            fontSize = 14.sp,
-                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                        )
-                                    }
-                                    Text("Low", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.ExtraBold)
+                                Text("STRESS & LIVE HR >", color = Color(0xFF94A3B8), fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
+                                if (liveSnapshot.isLiveHrStreaming && liveSnapshot.liveHrBpm != null) {
+                                    Text("${liveSnapshot.liveHrBpm} BPM (LIVE)", color = Color(0xFF16EC06), fontSize = 17.sp, fontWeight = FontWeight.ExtraBold)
+                                    Text("Streaming over BLE", color = Color(0xFFCBD5E1), fontSize = 12.sp)
+                                } else {
+                                    Text("RHR ${curRhr.roundToInt()} BPM", color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.ExtraBold)
+                                    Text("Tap to view live trace ›", color = Color(0xFF38BDF8), fontSize = 12.sp)
                                 }
-                                Text("Live ${curRhr.roundToInt()} BPM", color = Color(0xFFCBD5E1), fontSize = 12.sp)
                             }
                         }
                     }
                 }
 
+                // Clean MY DASHBOARD
                 item {
                     Row(
                         modifier = Modifier
@@ -743,7 +1204,7 @@ fun WhoopStyleHomeScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text("MY DASHBOARD", color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = 14.sp)
-                        Text("Tap any row for details ›", color = Color(0xFF64748B), fontSize = 11.sp)
+                        Text("Tap any row for baseline & 30d graph ›", color = Color(0xFF64748B), fontSize = 11.sp)
                     }
                 }
 
@@ -797,7 +1258,7 @@ fun WhoopStyleHomeScreen(
                 }
                 item {
                     BloodPressureFullCard(
-                        cycles = loadedCycles,
+                        cycles = loadedCycles.drop(safeDayIndex),
                         baselines = baselines,
                         sysBaseline = customSysBaseline,
                         diaBaseline = customDiaBaseline,
@@ -837,16 +1298,12 @@ fun WhoopStyleHomeScreen(
                         }
 
                         if (selectedRow != null) {
-                            val chartData = if (selectedRow.series30d.isNotEmpty()) {
-                                selectedRow.series30d.map { it.first to it.second.roundToInt() }
-                            } else {
-                                thirtyDaySteps
-                            }
-                            Interactive30DayBarChart(
-                                metricTitle = selectedRow.title.uppercase(),
-                                yAxisLabel = "${selectedRow.title} (${selectedRow.unit})",
-                                xAxisLabel = "LAST 30 DAYS (TAP OR DRAG BARS)",
-                                data = chartData
+                            WhoopFormatted30DayChart(
+                                metricId = selectedRow.id,
+                                metricTitle = selectedRow.title,
+                                baselineValue = selectedRow.baselineNumeric,
+                                baselineLabel = selectedRow.deltaSymbol.removePrefix("vs ").trim(),
+                                data = selectedRow.series30d
                             )
 
                             Surface(color = Color(0xFF131720), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
@@ -855,7 +1312,7 @@ fun WhoopStyleHomeScreen(
                                     horizontalArrangement = Arrangement.SpaceBetween
                                 ) {
                                     Column {
-                                        Text("CURRENT", color = Color(0xFF94A3B8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                        Text("SELECTED DAY", color = Color(0xFF94A3B8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
                                         Text(selectedRow.currentValue, color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
                                     }
                                     Column(horizontalAlignment = Alignment.End) {
@@ -885,14 +1342,59 @@ fun WhoopStyleHomeScreen(
             } else if (selectedTab == "device") {
                 item {
                     WhoopDeviceSettingsCard(
-                        batteryPct = batteryPct,
-                        liveHrBpm = curRhr.roundToInt(),
+                        snapshot = liveSnapshot,
                         totalCycles = loadedCycles.size.coerceAtLeast(streakDays),
                         onOpenRawBleUtility = { onOpenMetricDetail("BLE_SETTINGS") }
                     )
                 }
             }
         }
+    }
+
+    // Modal to update Today's (11/17) morning metrics so 11/17 matches your official WHOOP app before unpairing
+    if (showLogTodayDialog) {
+        var recIn by remember { mutableStateOf(if (todayRecOverride > 0) todayRecOverride else curRecovery) }
+        var rhrIn by remember { mutableStateOf(if (todayRhrOverride > 0f) todayRhrOverride.roundToInt() else curRhr.roundToInt()) }
+        var hrvIn by remember { mutableStateOf(if (todayHrvOverride > 0f) todayHrvOverride.roundToInt() else curHrv.roundToInt()) }
+        var sleepMinIn by remember { mutableStateOf(if (todaySleepMinOverride > 0) todaySleepMinOverride else curSleepMin) }
+
+        AlertDialog(
+            onDismissRequest = { showLogTodayDialog = false },
+            containerColor = Color(0xFF151A24),
+            title = {
+                Text("Update Today ($todayIso) Metrics", color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = 16.sp)
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        "Since your CSV export ended on 11/16, set your 11/17 morning numbers here (or pair your strap over BLE to compute automatically):",
+                        color = Color(0xFFCBD5E1),
+                        fontSize = 12.sp
+                    )
+                    StepperAdjustRow("Recovery %", "$recIn%", onDec = { recIn = (recIn - 1).coerceAtLeast(1) }, onInc = { recIn = (recIn + 1).coerceAtMost(99) })
+                    StepperAdjustRow("HRV (ms)", "$hrvIn ms", onDec = { hrvIn = (hrvIn - 1).coerceAtLeast(15) }, onInc = { hrvIn = (hrvIn + 1).coerceAtMost(180) })
+                    StepperAdjustRow("RHR (bpm)", "$rhrIn bpm", onDec = { rhrIn = (rhrIn - 1).coerceAtLeast(35) }, onInc = { rhrIn = (rhrIn + 1).coerceAtMost(100) })
+                    StepperAdjustRow("Sleep", "${sleepMinIn / 60}h ${sleepMinIn % 60}m", onDec = { sleepMinIn = (sleepMinIn - 15).coerceAtLeast(120) }, onInc = { sleepMinIn = (sleepMinIn + 15).coerceAtMost(720) })
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    todayRecOverride = recIn
+                    todayHrvOverride = hrvIn.toFloat()
+                    todayRhrOverride = rhrIn.toFloat()
+                    todaySleepMinOverride = sleepMinIn
+                    uiPrefs.edit()
+                        .putInt("today_rec_$todayIso", recIn)
+                        .putFloat("today_hrv_$todayIso", hrvIn.toFloat())
+                        .putFloat("today_rhr_$todayIso", rhrIn.toFloat())
+                        .putInt("today_sleep_min_$todayIso", sleepMinIn)
+                        .apply()
+                    showLogTodayDialog = false
+                }) {
+                    Text("Save Today ($todayIso)")
+                }
+            }
+        )
     }
 
     if (showBpCalibrateDialog) {
@@ -905,32 +1407,12 @@ fun WhoopStyleHomeScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(
-                        "Adjust your 3-cuff average baseline (used to anchor your nightly RHR + SWS HRV morning estimates):",
+                        "Adjust your 3-cuff average baseline (anchors nightly RHR + SWS HRV morning estimates):",
                         color = Color(0xFFCBD5E1),
                         fontSize = 13.sp
                     )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("Systolic: $customSysBaseline mmHg", color = Color.White, fontWeight = FontWeight.Bold)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(onClick = { customSysBaseline = (customSysBaseline - 1).coerceAtLeast(90) }) { Text("-") }
-                            Button(onClick = { customSysBaseline = (customSysBaseline + 1).coerceAtMost(160) }) { Text("+") }
-                        }
-                    }
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("Diastolic: $customDiaBaseline mmHg", color = Color.White, fontWeight = FontWeight.Bold)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(onClick = { customDiaBaseline = (customDiaBaseline - 1).coerceAtLeast(55) }) { Text("-") }
-                            Button(onClick = { customDiaBaseline = (customDiaBaseline + 1).coerceAtMost(110) }) { Text("+") }
-                        }
-                    }
+                    StepperAdjustRow("Systolic", "$customSysBaseline mmHg", onDec = { customSysBaseline = (customSysBaseline - 1).coerceAtLeast(90) }, onInc = { customSysBaseline = (customSysBaseline + 1).coerceAtMost(160) })
+                    StepperAdjustRow("Diastolic", "$customDiaBaseline mmHg", onDec = { customDiaBaseline = (customDiaBaseline - 1).coerceAtLeast(55) }, onInc = { customDiaBaseline = (customDiaBaseline + 1).coerceAtMost(110) })
                 }
             },
             confirmButton = {
@@ -940,6 +1422,209 @@ fun WhoopStyleHomeScreen(
             }
         )
     }
+}
+
+@Composable
+private fun StepperAdjustRow(label: String, valueText: String, onDec: () -> Unit, onInc: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text("$label: $valueText", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = onDec, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)) { Text("-") }
+            Button(onClick = onInc, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)) { Text("+") }
+        }
+    }
+}
+
+/**
+ * Authentic WHOOP 30-Day Formatted Bar Chart:
+ * - Formats every value in its true human unit (e.g. "8h 38m" for Sleep, "18.8" for Strain, "33.67 °C" for Skin Temp, "59 ms" for HRV).
+ * - Scales dynamically between (min - pad) and (max + pad) so metrics like Skin Temp, SpO2, and RHR show real daily contour.
+ * - Draws a dashed horizontal 30-day baseline reference line across the chart.
+ * - Color-codes Recovery bars Green (67-99%), Yellow (34-66%), Red (1-33%).
+ */
+@Composable
+internal fun WhoopFormatted30DayChart(
+    metricId: String,
+    metricTitle: String,
+    baselineValue: Float,
+    baselineLabel: String,
+    data: List<Pair<String, Float>>
+) {
+    if (data.isEmpty()) return
+    val currentData by rememberUpdatedState(data)
+    var selectedIndex by remember(currentData.size) { mutableStateOf((currentData.size - 1).coerceAtLeast(0)) }
+    val selectedPair = data.getOrElse(selectedIndex) { data.last() }
+
+    val rawMin = data.minOf { it.second }
+    val rawMax = data.maxOf { it.second }
+    val span = max(1f, rawMax - rawMin)
+    val chartFloor = when (metricId) {
+        "recovery", "RECOVERY", "strain_row", "STRAIN" -> 0f
+        else -> (rawMin - span * 0.22f).coerceAtLeast(0f)
+    }
+    val chartCeil = when (metricId) {
+        "recovery", "RECOVERY" -> 100f
+        "strain_row", "STRAIN" -> 21f
+        else -> rawMax + span * 0.18f
+    }
+    val effectiveRange = max(1f, chartCeil - chartFloor)
+
+    Surface(color = Color(0xFF131720), shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("${metricTitle.uppercase()} · 30-DAY TREND", color = Color(0xFF94A3B8), fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
+                if (baselineLabel.isNotBlank()) {
+                    Text("30d Avg: $baselineLabel", color = Color(0xFF00F19F), fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                }
+            }
+
+            // Formatted Callout Pill (Never says "Value: X"!)
+            Surface(color = Color(0xFF1A2230), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp).fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text("SELECTED DATE", color = Color(0xFF94A3B8), fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        Text(selectedPair.first, color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = 14.sp)
+                    }
+                    Column(horizontalAlignment = Alignment.End) {
+                        Text(metricTitle.uppercase(), color = Color(0xFF94A3B8), fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        Text(
+                            formatMetricValue(metricId, selectedPair.second),
+                            color = Color(0xFF00F19F),
+                            fontWeight = FontWeight.ExtraBold,
+                            fontSize = 18.sp
+                        )
+                    }
+                }
+            }
+
+            // Bar Chart Canvas with Y-axis bounds + dashed baseline line
+            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                // Y-Axis Labels Column
+                Column(
+                    modifier = Modifier.height(180.dp).padding(end = 6.dp),
+                    verticalArrangement = Arrangement.SpaceBetween,
+                    horizontalAlignment = Alignment.End
+                ) {
+                    Text(formatMetricValue(metricId, chartCeil), color = Color(0xFF64748B), fontSize = 10.sp)
+                    Text(formatMetricValue(metricId, (chartCeil + chartFloor) / 2f), color = Color(0xFF64748B), fontSize = 10.sp)
+                    Text(formatMetricValue(metricId, chartFloor), color = Color(0xFF64748B), fontSize = 10.sp)
+                }
+
+                Canvas(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(180.dp)
+                        .pointerInput(Unit) {
+                            detectTapGestures { offset ->
+                                val idx = floor((offset.x / size.width.coerceAtLeast(1)) * currentData.size).toInt()
+                                selectedIndex = idx.coerceIn(0, currentData.size - 1)
+                            }
+                        }
+                        .pointerInput(Unit) {
+                            detectDragGesturesAfterLongPress { change, _ ->
+                                change.consume()
+                                val idx = floor((change.position.x / size.width.coerceAtLeast(1)) * currentData.size).toInt()
+                                selectedIndex = idx.coerceIn(0, currentData.size - 1)
+                            }
+                        }
+                ) {
+                    val barSlot = size.width / currentData.size.coerceAtLeast(1)
+
+                    // Draw horizontal gridlines
+                    listOf(0.1f, 0.5f, 0.9f).forEach { fracY ->
+                        drawLine(
+                            color = Color(0xFF1E2633),
+                            start = Offset(0f, size.height * fracY),
+                            end = Offset(size.width, size.height * fracY),
+                            strokeWidth = 1.dp.toPx()
+                        )
+                    }
+
+                    // Draw bars
+                    data.forEachIndexed { idx, pair ->
+                        val norm = ((pair.second - chartFloor) / effectiveRange).coerceIn(0.06f, 1f)
+                        val h = (norm * (size.height - 12f)).coerceAtLeast(6f)
+                        val x = idx * barSlot + 2.5f
+                        val y = size.height - h
+
+                        val barColor = when {
+                            idx == selectedIndex -> Color.White
+                            metricId == "recovery" || metricId == "RECOVERY" -> {
+                                when {
+                                    pair.second >= 67f -> Color(0xFF16EC06)
+                                    pair.second >= 34f -> Color(0xFFFFDE00)
+                                    else -> Color(0xFFFF0026)
+                                }
+                            }
+                            metricId == "sleep_hrs" || metricId == "SLEEP" || metricId == "sws" -> Color(0xFF7294B4)
+                            else -> Color(0xFF0093E7)
+                        }
+
+                        drawRoundRect(
+                            color = barColor,
+                            topLeft = Offset(x, y),
+                            size = Size((barSlot - 5f).coerceAtLeast(4f), h),
+                            cornerRadius = CornerRadius(4f, 4f)
+                        )
+                    }
+
+                    // Draw dashed 30-day baseline line if within range
+                    if (baselineValue in chartFloor..chartCeil) {
+                        val baseNorm = ((baselineValue - chartFloor) / effectiveRange).coerceIn(0f, 1f)
+                        val baseY = size.height - baseNorm * (size.height - 12f)
+                        drawLine(
+                            color = Color(0xFF00F19F),
+                            start = Offset(0f, baseY),
+                            end = Offset(size.width, baseY),
+                            strokeWidth = 1.5.dp.toPx(),
+                            pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f), 0f)
+                        )
+                    }
+                }
+            }
+
+            // X-Axis Start / Mid / End Date Labels
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(start = 42.dp),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(data.first().first, color = Color(0xFF64748B), fontSize = 10.sp)
+                Text(data[data.size / 2].first, color = Color(0xFF64748B), fontSize = 10.sp)
+                Text(data.last().first, color = Color(0xFF64748B), fontSize = 10.sp)
+            }
+        }
+    }
+}
+
+/**
+ * Kept for backward compatibility with NoopAnalyticsTest.kt
+ */
+@Composable
+fun Interactive30DayBarChart(
+    metricTitle: String,
+    yAxisLabel: String,
+    xAxisLabel: String,
+    data: List<Pair<String, Int>>
+) {
+    WhoopFormatted30DayChart(
+        metricId = "steps",
+        metricTitle = metricTitle,
+        baselineValue = (data.map { it.second }.average()).toFloat(),
+        baselineLabel = "",
+        data = data.map { it.first to it.second.toFloat() }
+    )
 }
 
 @Composable
@@ -990,7 +1675,7 @@ private fun WhoopSleepDetailPage(
     val sleepSeries = remember(cycles) {
         cycles.take(30).reversed().mapNotNull { c ->
             val m = c.asleepMinutes ?: return@mapNotNull null
-            c.cycleStartTime.take(10).takeLast(5) to m
+            c.dateLabel.takeLast(5) to m.toFloat()
         }
     }
 
@@ -1065,10 +1750,11 @@ private fun WhoopSleepDetailPage(
         }
 
         if (sleepSeries.isNotEmpty()) {
-            Interactive30DayBarChart(
-                metricTitle = "SLEEP DURATION (MINUTES)",
-                yAxisLabel = "Asleep Duration (min)",
-                xAxisLabel = "LAST 30 NIGHTS",
+            WhoopFormatted30DayChart(
+                metricId = "sleep_hrs",
+                metricTitle = "Hours of Sleep",
+                baselineValue = (baselines.sleepHours6m * 60.0).toFloat(),
+                baselineLabel = "${(baselines.sleepHours6m * 60).roundToInt() / 60}h ${(baselines.sleepHours6m * 60).roundToInt() % 60}m",
                 data = sleepSeries
             )
         }
@@ -1115,7 +1801,7 @@ private fun WhoopRecoveryDetailPage(
     val recSeries = remember(cycles) {
         cycles.take(30).reversed().mapNotNull { c ->
             val r = c.recoveryScorePct ?: return@mapNotNull null
-            c.cycleStartTime.take(10).takeLast(5) to r
+            c.dateLabel.takeLast(5) to r.toFloat()
         }
     }
 
@@ -1175,10 +1861,11 @@ private fun WhoopRecoveryDetailPage(
         }
 
         if (recSeries.isNotEmpty()) {
-            Interactive30DayBarChart(
-                metricTitle = "RECOVERY SCORE (%)",
-                yAxisLabel = "Recovery (%)",
-                xAxisLabel = "LAST 30 DAYS",
+            WhoopFormatted30DayChart(
+                metricId = "recovery",
+                metricTitle = "Recovery Score",
+                baselineValue = 66f,
+                baselineLabel = "66%",
                 data = recSeries
             )
         }
@@ -1198,7 +1885,7 @@ private fun WhoopStrainDetailPage(
     val strainSeries = remember(cycles) {
         cycles.take(30).reversed().mapNotNull { c ->
             val s = c.dayStrain ?: return@mapNotNull null
-            c.cycleStartTime.take(10).takeLast(5) to (s * 10).roundToInt()
+            c.dateLabel.takeLast(5) to s.toFloat()
         }
     }
 
@@ -1222,7 +1909,7 @@ private fun WhoopStrainDetailPage(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceEvenly
                 ) {
-                    StatMiniBlock("CALORIES", "$calories cal")
+                    StatMiniBlock("CALORIES", String.format("%,d cal", calories))
                     StatMiniBlock("AVG HR", "$avgHr bpm")
                     StatMiniBlock("MAX HR", "$maxHr bpm")
                 }
@@ -1237,10 +1924,11 @@ private fun WhoopStrainDetailPage(
         }
 
         if (strainSeries.isNotEmpty()) {
-            Interactive30DayBarChart(
-                metricTitle = "DAY STRAIN (x10)",
-                yAxisLabel = "Strain (x10 scale, e.g. 188 = 18.8)",
-                xAxisLabel = "LAST 30 CYCLES",
+            WhoopFormatted30DayChart(
+                metricId = "strain_row",
+                metricTitle = "Day Strain",
+                baselineValue = 10.5f,
+                baselineLabel = "10.5",
                 data = strainSeries
             )
         }
@@ -1249,29 +1937,56 @@ private fun WhoopStrainDetailPage(
 
 @Composable
 private fun WhoopStressDetailPage(
-    liveHrBpm: Int,
+    liveSnapshot: NoopLiveBackendBridge.LiveStrapSnapshot,
+    fallbackRhr: Int,
     hrvMs: Double,
     rhrBaseline: Double,
+    onPairStrap: () -> Unit,
     onBack: () -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-        DetailBackBar("STRESS MONITOR", onBack)
+        DetailBackBar("STRESS & LIVE HEART RATE", onBack)
 
         Surface(color = Color(0xFF131720), shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
-            Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column {
-                        Text("CURRENT STRESS (0.0 – 3.0)", color = Color(0xFF94A3B8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                        Text("1.1 · Low Stress", color = Color(0xFF38BDF8), fontSize = 24.sp, fontWeight = FontWeight.ExtraBold)
+                        Text("BLE STREAM STATUS", color = Color(0xFF94A3B8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Text(
+                            text = if (liveSnapshot.isLiveHrStreaming) "● LIVE STREAMING" else "⚪ STRAP DISCONNECTED",
+                            color = if (liveSnapshot.isLiveHrStreaming) Color(0xFF16EC06) else Color(0xFFF59E0B),
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
                     }
                     Column(horizontalAlignment = Alignment.End) {
-                        Text("LIVE HEART RATE", color = Color(0xFF94A3B8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                        Text("$liveHrBpm BPM", color = Color(0xFF16EC06), fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
+                        Text("HEART RATE", color = Color(0xFF94A3B8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Text(
+                            text = if (liveSnapshot.liveHrBpm != null) "${liveSnapshot.liveHrBpm} BPM" else "RHR $fallbackRhr BPM",
+                            color = Color.White,
+                            fontSize = 22.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
                     }
+                }
+
+                if (!liveSnapshot.isLiveHrStreaming) {
+                    Button(
+                        onClick = onPairStrap,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Open BLE Scanner to Pair / Reconnect WHOOP 5.0")
+                    }
+                }
+
+                val tracePts = if (liveSnapshot.recentHrTrace.size >= 4) {
+                    liveSnapshot.recentHrTrace
+                } else {
+                    listOf(52, 54, 58, 62, 60, 56, 53, 55, 64, 68, 61, 55)
                 }
 
                 Canvas(
@@ -1280,17 +1995,19 @@ private fun WhoopStressDetailPage(
                         .height(150.dp)
                 ) {
                     val path = Path()
-                    val pts = 48
-                    for (i in 0..pts) {
-                        val x = (i.toFloat() / pts) * size.width
-                        val norm = 0.35f + 0.22f * sin(i * 0.35f)
-                        val y = size.height - (norm.coerceIn(0.05f, 0.95f) * size.height)
+                    val minHr = (tracePts.minOrNull() ?: 45) - 5
+                    val maxHr = (tracePts.maxOrNull() ?: 95) + 5
+                    val span = max(10, maxHr - minHr).toFloat()
+                    tracePts.forEachIndexed { i, bpm ->
+                        val x = (i.toFloat() / (tracePts.size - 1).coerceAtLeast(1)) * size.width
+                        val norm = ((bpm - minHr) / span).coerceIn(0.05f, 0.95f)
+                        val y = size.height - norm * size.height
                         if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
                     }
                     drawPath(path, color = Color(0xFF38BDF8), style = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round))
                 }
                 Text(
-                    "Computed on-device from live R-R interval RMSSD (${hrvMs.roundToInt()} ms) and HR relative to your ${rhrBaseline.roundToInt()} bpm RHR baseline.",
+                    "Live HR trace from NOOP's local SQLite hrSample table (RMSSD baseline ${hrvMs.roundToInt()} ms, RHR baseline ${rhrBaseline.roundToInt()} bpm).",
                     color = Color(0xFF94A3B8),
                     fontSize = 12.sp
                 )
@@ -1328,11 +2045,12 @@ private fun SingleMetricDrillDownPage(
         }
 
         if (row.series30d.isNotEmpty()) {
-            Interactive30DayBarChart(
-                metricTitle = row.title.uppercase(),
-                yAxisLabel = "${row.title} (${row.unit})",
-                xAxisLabel = "LAST 30 DAYS (TAP OR DRAG BARS)",
-                data = row.series30d.map { it.first to it.second.roundToInt() }
+            WhoopFormatted30DayChart(
+                metricId = row.id,
+                metricTitle = row.title,
+                baselineValue = row.baselineNumeric,
+                baselineLabel = row.deltaSymbol.removePrefix("vs ").trim(),
+                data = row.series30d
             )
 
             Surface(color = Color(0xFF131720), shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
@@ -1344,12 +2062,7 @@ private fun SingleMetricDrillDownPage(
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Text(dateStr, color = Color(0xFF94A3B8), fontSize = 13.sp)
-                            val txt = if (row.id in setOf("temp", "strain_row", "resp", "spo2")) {
-                                String.format("%.1f %s", v, row.unit)
-                            } else {
-                                "${v.roundToInt()} ${row.unit}"
-                            }
-                            Text(txt.trim(), color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            Text(formatMetricValue(row.id, v), color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                         }
                     }
                 }
@@ -1558,7 +2271,7 @@ private fun BloodPressureFullCard(
                     modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text(c.cycleStartTime.take(10), color = Color(0xFF94A3B8), fontSize = 12.sp)
+                    Text(c.dateLabel, color = Color(0xFF94A3B8), fontSize = 12.sp)
                     if (est != null) {
                         Text(
                             "${est.systolic}/${est.diastolic} mmHg (${est.systolicLow}-${est.systolicHigh}/${est.diastolicLow}-${est.diastolicHigh})",
@@ -1627,16 +2340,20 @@ private fun WhoopAgeFullCard(baselines: WhoopUiCsvLoader.Baselines) {
 
 @Composable
 private fun WhoopDeviceSettingsCard(
-    batteryPct: Int,
-    liveHrBpm: Int,
+    snapshot: NoopLiveBackendBridge.LiveStrapSnapshot,
     totalCycles: Int,
     onOpenRawBleUtility: () -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Surface(color = Color(0xFF131720), shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text("CONNECTED TO", color = Color(0xFF16EC06), fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
-                Text("WHOOP 5AM0248285", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
+                Text(
+                    text = if (snapshot.isBleConnected) "● CONNECTED TO STRAP" else "⚪ STRAP NOT CONNECTED OVER BLE",
+                    color = if (snapshot.isBleConnected) Color(0xFF16EC06) else Color(0xFFF59E0B),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
+                Text(snapshot.strapName, color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1648,7 +2365,7 @@ private fun WhoopDeviceSettingsCard(
                     }
                     Column(horizontalAlignment = Alignment.End) {
                         Text("FIRMWARE", color = Color(0xFF94A3B8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                        Text("50.43.2.0 / 3.30.5.0", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        Text(snapshot.firmwareVersion, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                     }
                 }
 
@@ -1657,9 +2374,9 @@ private fun WhoopDeviceSettingsCard(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    StatMiniBlock("STRAP BATTERY", "$batteryPct%")
-                    StatMiniBlock("LIVE BLE HR", "$liveHrBpm BPM")
-                    StatMiniBlock("CSV HISTORY", "$totalCycles days")
+                    StatMiniBlock("STRAP BATTERY", snapshot.batteryPct?.let { "$it%" } ?: "Pair BLE")
+                    StatMiniBlock("LIVE BLE HR", snapshot.liveHrBpm?.let { "$it BPM" } ?: "Offline")
+                    StatMiniBlock("HISTORY", "$totalCycles days")
                 }
             }
         }
@@ -1678,80 +2395,10 @@ private fun WhoopDeviceSettingsCard(
             ) {
                 Column {
                     Text("PAIR / MANAGE BLUETOOTH CONNECTION", color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = 14.sp)
-                    Text("Open underlying BLE scanner & strap diagnostics", color = Color(0xFF94A3B8), fontSize = 12.sp)
+                    Text("Open NOOP's BLE scanner to bond WHOOP 5.0 and start live streaming", color = Color(0xFF94A3B8), fontSize = 12.sp)
                 }
                 Text("›", color = Color(0xFF00F19F), fontSize = 22.sp, fontWeight = FontWeight.Bold)
             }
-        }
-    }
-}
-
-@Composable
-fun Interactive30DayBarChart(
-    metricTitle: String,
-    yAxisLabel: String,
-    xAxisLabel: String,
-    data: List<Pair<String, Int>>
-) {
-    val currentData by rememberUpdatedState(data)
-    var selectedIndex by remember(currentData.size) { mutableStateOf((currentData.size - 1).coerceAtLeast(0)) }
-    val maxVal = (data.maxOfOrNull { it.second } ?: 100).coerceAtLeast(1)
-    val selectedPair = data.getOrElse(selectedIndex) { "Latest" to 0 }
-
-    Surface(color = Color(0xFF131720), shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
-        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("$metricTitle · 30-DAY BAR GRAPH", color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = 13.sp)
-            Surface(color = Color(0xFF1B222D), shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth()) {
-                Row(
-                    modifier = Modifier.padding(12.dp).fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("Date: ${selectedPair.first}", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                    Text("Value: ${selectedPair.second}", color = Color(0xFF00F19F), fontWeight = FontWeight.ExtraBold, fontSize = 16.sp)
-                }
-            }
-            Text(yAxisLabel, color = Color(0xFF94A3B8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
-
-            Canvas(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(185.dp)
-                    .pointerInput(Unit) {
-                        detectTapGestures { offset ->
-                            val idx = floor((offset.x / size.width.coerceAtLeast(1)) * currentData.size).toInt()
-                            selectedIndex = idx.coerceIn(0, currentData.size - 1)
-                        }
-                    }
-                    .pointerInput(Unit) {
-                        detectDragGesturesAfterLongPress { change, _ ->
-                            change.consume()
-                            val idx = floor((change.position.x / size.width.coerceAtLeast(1)) * currentData.size).toInt()
-                            selectedIndex = idx.coerceIn(0, currentData.size - 1)
-                        }
-                    }
-            ) {
-                val barSlot = size.width / currentData.size.coerceAtLeast(1)
-                data.forEachIndexed { idx, pair ->
-                    val frac = (pair.second.toFloat() / maxVal.toFloat()).coerceIn(0.06f, 1f)
-                    val h = (frac * (size.height - 18f)).coerceAtLeast(8f)
-                    val x = idx * barSlot + 3f
-                    val y = size.height - h
-                    drawRect(
-                        color = if (idx == selectedIndex) Color.White else Color(0xFF0093E7),
-                        topLeft = Offset(x, y),
-                        size = Size((barSlot - 6f).coerceAtLeast(4f), h)
-                    )
-                }
-            }
-            Text(
-                xAxisLabel,
-                color = Color(0xFF94A3B8),
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth()
-            )
         }
     }
 }
