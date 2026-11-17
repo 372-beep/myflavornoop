@@ -1120,80 +1120,34 @@ fun NoopRoot() {
         return
     }
 
-    // Seed bundled 636-day WHOOP CSV export off the main thread
-    val cycles by produceState<List<WhoopCsvHistoricalImporter.HistoricalCycleRecord>>(initialValue = emptyList()) {
-        value = withContext(Dispatchers.IO) {
-            runCatching { WhoopCsvHistoricalImporter.loadBundledCycles(context) }.getOrDefault(emptyList())
-        }
-    }
-    val baselines = remember { WhoopCsvHistoricalImporter.CalibratedUserBaselines() }
-    val latest = cycles.firstOrNull()
-    val prevStrainCycle = cycles.firstOrNull { it.dayStrain != null }
-
-    val dashboardRows = remember(latest, baselines) {
-        val hrv = latest?.hrvMs ?: baselines.rmssd30dMeanMs
-        val rhr = latest?.rhrBpm ?: baselines.rhr30dMeanBpm
-        val resp = latest?.respRateRpm ?: baselines.resp30dMeanRpm
-        val spo2 = latest?.spo2Pct ?: baselines.spo230dMeanPct
-        val temp = latest?.skinTempC ?: baselines.skinTemp30dMeanC
-        val sleepMin = latest?.asleepMinutes ?: 518
-        val deepMin = latest?.deepSwsMinutes ?: 114
-        val remMin = latest?.remMinutes ?: 91
-        listOf(
-            DashboardRowItem("hrv", "HRV", "${hrv.toInt()} ms", "vs ${baselines.rmssd30dMeanMs.toInt()} ms", "30d baseline", hrv >= baselines.rmssd30dMeanMs),
-            DashboardRowItem("rhr", "Resting Heart Rate", "${rhr.toInt()} bpm", "vs ${baselines.rhr30dMeanBpm.toInt()} bpm", "30d baseline", rhr <= baselines.rhr30dMeanBpm),
-            DashboardRowItem("resp", "Respiratory Rate", String.format("%.1f rpm", resp), "vs ${String.format("%.1f", baselines.resp30dMeanRpm)}", "30d baseline", true),
-            DashboardRowItem("spo2", "Blood Oxygen", String.format("%.1f%%", spo2), "vs ${String.format("%.1f%%", baselines.spo230dMeanPct)}", "30d baseline", spo2 >= 94.0),
-            DashboardRowItem("temp", "Skin Temperature", String.format("%.2f °C", temp), "vs ${String.format("%.2f °C", baselines.skinTemp30dMeanC)}", "30d baseline", true),
-            DashboardRowItem("sleep", "Hours of Sleep", "${sleepMin / 60}h ${sleepMin % 60}m", "${latest?.sleepPerformancePct ?: 80}% perf", "Last night", (latest?.sleepPerformancePct ?: 80) >= 75),
-            DashboardRowItem("sws", "Restorative (SWS + REM)", "${(deepMin + remMin) / 60}h ${(deepMin + remMin) % 60}m", "SWS ${deepMin}m · REM ${remMin}m", "Last night", true),
-            DashboardRowItem("strain", "Day Strain", String.format("%.1f", prevStrainCycle?.dayStrain ?: 18.8), "Max ${prevStrainCycle?.maxHrBpm ?: 163} bpm", "Latest completed", true),
-        )
-    }
-
-    val thirtyDaySeries = remember(cycles) {
-        cycles.take(30).reversed().mapIndexed { idx, c ->
-            val label = c.cycleStartTime.take(10).takeLast(5)
-            val valInt = c.recoveryScorePct ?: 55
-            (if (label.isNotBlank()) label else "D${idx + 1}") to valInt
-        }.ifEmpty {
-            listOf("11-12" to 39, "11-13" to 68, "11-14" to 53, "11-15" to 55)
-        }
-    }
-
-    var showStockNoop by remember { mutableStateOf(false) }
+    var showStockBleUtility by remember { mutableStateOf(false) }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        if (showStockNoop) {
+        if (showStockBleUtility) {
             AppRoot(viewModel = appViewModel)
+            Surface(
+                color = Color(0xFF13171D).copy(alpha = 0.95f),
+                shape = RoundedCornerShape(50),
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(top = 48.dp, end = 16.dp)
+                    .clickable { showStockBleUtility = false },
+            ) {
+                Text(
+                    text = "← Back to WHOOP UI",
+                    color = Color(0xFF00F19F),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                )
+            }
         } else {
             WhoopStyleHomeScreen(
-                sleepPerformancePct = latest?.sleepPerformancePct ?: 80,
-                recoveryPct = latest?.recoveryScorePct ?: 55,
-                dayStrain = prevStrainCycle?.dayStrain ?: 18.8,
-                liveHrBpm = (latest?.rhrBpm ?: 51.0).toInt(),
-                batteryPct = 44,
-                streakDays = cycles.size.coerceAtLeast(baselines.totalHistoricalCycles),
-                dashboardRows = dashboardRows,
-                thirtyDaySteps = thirtyDaySeries,
-                onOpenMetricDetail = { showStockNoop = true },
-            )
-        }
-
-        Surface(
-            color = Color(0xFF1E242E).copy(alpha = 0.92f),
-            shape = RoundedCornerShape(50),
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(end = 14.dp, bottom = 72.dp)
-                .clickable { showStockNoop = !showStockNoop },
-        ) {
-            Text(
-                text = if (showStockNoop) "WHOOP UI" else "BLE & Settings",
-                color = Color(0xFF00F19F),
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                onOpenMetricDetail = { target ->
+                    if (target == "BLE_SETTINGS") {
+                        showStockBleUtility = true
+                    }
+                }
             )
         }
     }
