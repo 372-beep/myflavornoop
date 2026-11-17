@@ -1,4 +1,3 @@
-
 package com.noop.ui
 
 import android.Manifest
@@ -1222,4 +1221,3 @@ fun NoopRoot() {
         }
     }
 }
-```
