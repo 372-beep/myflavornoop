@@ -52,6 +52,7 @@ import com.noop.analytics.WhoopCsvHistoricalImporter
 import com.noop.ble.WhoopModel
 import com.noop.data.DemoSeeder
 import com.noop.data.WhoopRepository
+import com.noop.ingest.WhoopCsvImporter
 import com.noop.push.SelfHostedPushScheduler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
@@ -106,9 +107,10 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        if (NoopPrefs.of(this).getBoolean(NoopPrefs.KEY_ONBOARDED, false)) {
-            requestBlePermissions()
-        }
+        // Auto-complete first-time setup with Alex's personal profile, WHOOP 5.0 / MG defaults,
+        // and one-shot Room database seeding from bundled assets/whoop_export/ CSVs.
+        ensureAlexDefaultsAndSeedHistory()
+        requestBlePermissions()
 
         runCatching { DebugExportScheduler.reschedule(applicationContext) }
         runCatching { CoachBriefScheduler.reschedule(applicationContext) }
@@ -149,6 +151,49 @@ class MainActivity : ComponentActivity() {
         }.toTypedArray()
 
         if (needed.isNotEmpty()) permissionLauncher.launch(needed)
+    }
+
+    /**
+     * Pre-populates Alex's personal profile, accepts terms/onboarding automatically so fresh APK
+     * installs never force a 12-page wizard, defaults the BLE scanner to WHOOP 5.0 / MG, and seeds
+     * the bundled 636-day WHOOP CSV export into Room SQLite once.
+     */
+    private fun ensureAlexDefaultsAndSeedHistory() {
+        val prefs = NoopPrefs.of(this)
+        if (!prefs.getBoolean(NoopPrefs.KEY_ONBOARDED, false) ||
+            prefs.getString(NoopPrefs.KEY_ACCEPTED_TERMS_VERSION, "") != Terms.CURRENT_VERSION
+        ) {
+            prefs.edit()
+                .putString(NoopPrefs.KEY_ACCEPTED_TERMS_VERSION, Terms.CURRENT_VERSION)
+                .putString(NoopPrefs.KEY_ACCEPTED_TERMS_AT, java.time.Instant.now().toString())
+                .putBoolean(NoopPrefs.KEY_ONBOARDED, true)
+                .putString(NoopPrefs.KEY_LAST_SEEN_CHANGELOG, AppChangelog.CURRENT_VERSION)
+                .putBoolean(NoopPrefs.KEY_BACKGROUND_CONNECTION, true)
+                .putBoolean(NoopPrefs.KEY_CONTINUOUS_HRV, true)
+                .putString("noop.selectedWhoopModel", WhoopModel.WHOOP5_MG.name)
+                .apply()
+
+            runCatching {
+                val profile = ProfileStore.from(applicationContext)
+                profile.setAge(30)
+                profile.sex = "male"
+                profile.hrMaxOverride = 203
+            }
+        } else if (!prefs.contains("noop.selectedWhoopModel")) {
+            prefs.edit().putString("noop.selectedWhoopModel", WhoopModel.WHOOP5_MG.name).apply()
+        }
+
+        if (!prefs.getBoolean("noop.bundledCsvSeeded.v1", false)) {
+            lifecycleScope.launch(Dispatchers.IO) {
+                runCatching {
+                    val repo = (application as NoopApplication).repository
+                    val summary = WhoopCsvImporter.importBundledAssets(applicationContext, repo)
+                    if (summary.counts.isNotEmpty()) {
+                        prefs.edit().putBoolean("noop.bundledCsvSeeded.v1", true).apply()
+                    }
+                }
+            }
+        }
     }
 }
 

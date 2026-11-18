@@ -23,12 +23,16 @@ jobs:
         run: chmod +x ./gradlew
         working-directory: ./android
 
+      - name: Run Custom NOOP Unit Tests
+        run: ./gradlew testFullDebugUnitTest --tests "com.noop.analytics.NoopAnalyticsTest"
+        working-directory: ./android
+
       - name: Build Debug APK
-        run: ./gradlew assembleDebug
+        run: ./gradlew assembleFullDebug
         working-directory: ./android
 
       - name: Upload Compiled NOOP APK
         uses: actions/upload-artifact@v4
         with:
           name: NOOP-Custom-WHOOP-Debug-APK
-          path: android/app/build/outputs/apk/debug/*.apk
+          path: android/app/build/outputs/apk/full/debug/*.apk

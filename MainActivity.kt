@@ -52,6 +52,7 @@ import com.noop.analytics.WhoopCsvHistoricalImporter
 import com.noop.ble.WhoopModel
 import com.noop.data.DemoSeeder
 import com.noop.data.WhoopRepository
+import com.noop.ingest.WhoopCsvImporter
 import com.noop.push.SelfHostedPushScheduler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
@@ -106,9 +107,10 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        if (NoopPrefs.of(this).getBoolean(NoopPrefs.KEY_ONBOARDED, false)) {
-            requestBlePermissions()
-        }
+        // Auto-complete first-time setup with Alex's personal profile, WHOOP 5.0 / MG defaults,
+        // and one-shot Room database seeding from bundled assets/whoop_export/ CSVs.
+        ensureAlexDefaultsAndSeedHistory()
+        requestBlePermissions()
 
         runCatching { DebugExportScheduler.reschedule(applicationContext) }
         runCatching { CoachBriefScheduler.reschedule(applicationContext) }
@@ -149,6 +151,49 @@ class MainActivity : ComponentActivity() {
         }.toTypedArray()
 
         if (needed.isNotEmpty()) permissionLauncher.launch(needed)
+    }
+
+    /**
+     * Pre-populates Alex's personal profile, accepts terms/onboarding automatically so fresh APK
+     * installs never force a 12-page wizard, defaults the BLE scanner to WHOOP 5.0 / MG, and seeds
+     * the bundled 636-day WHOOP CSV export into Room SQLite once.
+     */
+    private fun ensureAlexDefaultsAndSeedHistory() {
+        val prefs = NoopPrefs.of(this)
+        if (!prefs.getBoolean(NoopPrefs.KEY_ONBOARDED, false) ||
+            prefs.getString(NoopPrefs.KEY_ACCEPTED_TERMS_VERSION, "") != Terms.CURRENT_VERSION
+        ) {
+            prefs.edit()
+                .putString(NoopPrefs.KEY_ACCEPTED_TERMS_VERSION, Terms.CURRENT_VERSION)
+                .putString(NoopPrefs.KEY_ACCEPTED_TERMS_AT, java.time.Instant.now().toString())
+                .putBoolean(NoopPrefs.KEY_ONBOARDED, true)
+                .putString(NoopPrefs.KEY_LAST_SEEN_CHANGELOG, AppChangelog.CURRENT_VERSION)
+                .putBoolean(NoopPrefs.KEY_BACKGROUND_CONNECTION, true)
+                .putBoolean(NoopPrefs.KEY_CONTINUOUS_HRV, true)
+                .putString("noop.selectedWhoopModel", WhoopModel.WHOOP5_MG.name)
+                .apply()
+
+            runCatching {
+                val profile = ProfileStore.from(applicationContext)
+                profile.setAge(30)
+                profile.sex = "male"
+                profile.hrMaxOverride = 203
+            }
+        } else if (!prefs.contains("noop.selectedWhoopModel")) {
+            prefs.edit().putString("noop.selectedWhoopModel", WhoopModel.WHOOP5_MG.name).apply()
+        }
+
+        if (!prefs.getBoolean("noop.bundledCsvSeeded.v1", false)) {
+            lifecycleScope.launch(Dispatchers.IO) {
+                runCatching {
+                    val repo = (application as NoopApplication).repository
+                    val summary = WhoopCsvImporter.importBundledAssets(applicationContext, repo)
+                    if (summary.counts.isNotEmpty()) {
+                        prefs.edit().putBoolean("noop.bundledCsvSeeded.v1", true).apply()
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1120,186 +1165,10 @@ fun NoopRoot() {
         return
     }
 
-    // Load bundled 636-day WHOOP CSV export + 390 workouts off the main thread
-    val cycles by produceState<List<WhoopCsvHistoricalImporter.HistoricalCycleRecord>>(initialValue = emptyList()) {
-        value = withContext(Dispatchers.IO) {
-            runCatching { WhoopCsvHistoricalImporter.loadBundledCycles(context) }.getOrDefault(emptyList())
-        }
-    }
-    val workouts by produceState<List<WhoopCsvHistoricalImporter.HistoricalWorkoutRecord>>(initialValue = emptyList()) {
-        value = withContext(Dispatchers.IO) {
-            runCatching { WhoopCsvHistoricalImporter.loadBundledWorkouts(context, 40) }.getOrDefault(emptyList())
-        }
-    }
-    val baselines = remember { WhoopCsvHistoricalImporter.CalibratedUserBaselines() }
-    val latest = cycles.firstOrNull()
-    val prevStrainCycle = cycles.firstOrNull { it.dayStrain != null }
-
-    val dashboardRows = remember(cycles, latest, prevStrainCycle, baselines) {
-        val chron30 = cycles.take(30).reversed()
-        fun seriesOf(extract: (WhoopCsvHistoricalImporter.HistoricalCycleRecord) -> Float?): List<Pair<String, Float>> =
-            chron30.mapNotNull { c ->
-                val v = extract(c) ?: return@mapNotNull null
-                val d = c.cycleStartTime.take(10).takeLast(5).ifBlank { "Day" }
-                d to v
-            }
-
-        val hrv = latest?.hrvMs ?: baselines.rmssd30dMeanMs
-        val rhr = latest?.rhrBpm ?: baselines.rhr30dMeanBpm
-        val resp = latest?.respRateRpm ?: baselines.resp30dMeanRpm
-        val spo2 = latest?.spo2Pct ?: baselines.spo230dMeanPct
-        val temp = latest?.skinTempC ?: baselines.skinTemp30dMeanC
-        val sleepMin = latest?.asleepMinutes ?: 518
-        val deepMin = latest?.deepSwsMinutes ?: 114
-        val remMin = latest?.remMinutes ?: 91
-        val strainVal = prevStrainCycle?.dayStrain ?: 18.8
-        val calsVal = prevStrainCycle?.caloriesBurned ?: 3392
-        val effVal = latest?.sleepEfficiencyPct ?: 93
-        val consVal = latest?.sleepConsistencyPct ?: 60
-        val debtMin = latest?.sleepDebtMinutes ?: 95
-
-        listOf(
-            DashboardRowItem(
-                id = "hrv",
-                title = "HRV",
-                currentValue = "${hrv.toInt()} ms",
-                deltaSymbol = "vs ${baselines.rmssd30dMeanMs.toInt()} ms",
-                baselineText = "30d baseline",
-                isPositive = hrv >= baselines.rmssd30dMeanMs - 5.0,
-                unit = "ms",
-                series30d = seriesOf { it.hrvMs?.toFloat() }
-            ),
-            DashboardRowItem(
-                id = "rhr",
-                title = "Resting Heart Rate",
-                currentValue = "${rhr.toInt()} bpm",
-                deltaSymbol = "vs ${baselines.rhr30dMeanBpm.toInt()} bpm",
-                baselineText = "30d baseline",
-                isPositive = rhr <= baselines.rhr30dMeanBpm + 2.0,
-                unit = "bpm",
-                series30d = seriesOf { it.rhrBpm?.toFloat() }
-            ),
-            DashboardRowItem(
-                id = "resp",
-                title = "Respiratory Rate",
-                currentValue = String.format("%.1f rpm", resp),
-                deltaSymbol = "vs ${String.format("%.1f rpm", baselines.resp30dMeanRpm)}",
-                baselineText = "30d baseline",
-                isPositive = true,
-                unit = "rpm",
-                series30d = seriesOf { it.respRateRpm?.toFloat() }
-            ),
-            DashboardRowItem(
-                id = "spo2",
-                title = "Blood Oxygen",
-                currentValue = String.format("%.1f%%", spo2),
-                deltaSymbol = "vs ${String.format("%.1f%%", baselines.spo230dMeanPct)}",
-                baselineText = "30d baseline",
-                isPositive = spo2 >= 94.0,
-                unit = "%",
-                series30d = seriesOf { it.spo2Pct?.toFloat() }
-            ),
-            DashboardRowItem(
-                id = "temp",
-                title = "Skin Temperature",
-                currentValue = String.format("%.2f °C", temp),
-                deltaSymbol = "vs ${String.format("%.2f °C", baselines.skinTemp30dMeanC)}",
-                baselineText = "30d baseline",
-                isPositive = true,
-                unit = "°C",
-                series30d = seriesOf { it.skinTempC?.toFloat() }
-            ),
-            DashboardRowItem(
-                id = "sleep",
-                title = "Hours of Sleep",
-                currentValue = "${sleepMin / 60}h ${sleepMin % 60}m",
-                deltaSymbol = "vs ${String.format("%.1fh", baselines.sleepHours6m)} (${latest?.sleepPerformancePct ?: 80}% perf)",
-                baselineText = "6m baseline",
-                isPositive = (latest?.sleepPerformancePct ?: 80) >= 75,
-                unit = "min",
-                series30d = seriesOf { it.asleepMinutes?.toFloat() }
-            ),
-            DashboardRowItem(
-                id = "sws",
-                title = "Restorative Sleep (SWS + REM)",
-                currentValue = "${(deepMin + remMin) / 60}h ${(deepMin + remMin) % 60}m",
-                deltaSymbol = "Deep ${deepMin}m · REM ${remMin}m",
-                baselineText = "Last night stages",
-                isPositive = (deepMin + remMin) >= 180,
-                unit = "min",
-                series30d = seriesOf {
-                    val d = it.deepSwsMinutes ?: return@seriesOf null
-                    val r = it.remMinutes ?: 0
-                    (d + r).toFloat()
-                }
-            ),
-            DashboardRowItem(
-                id = "strain",
-                title = "Day Strain",
-                currentValue = String.format("%.1f", strainVal),
-                deltaSymbol = "Max HR ${prevStrainCycle?.maxHrBpm ?: 163} bpm · Avg ${prevStrainCycle?.avgHrBpm ?: 79} bpm",
-                baselineText = "Latest completed cycle",
-                isPositive = true,
-                unit = "strain",
-                series30d = seriesOf { it.dayStrain?.toFloat() }
-            ),
-            DashboardRowItem(
-                id = "calories",
-                title = "Calories",
-                currentValue = "$calsVal cal",
-                deltaSymbol = "vs 2,240 cal avg",
-                baselineText = "30d baseline",
-                isPositive = true,
-                unit = "cal",
-                series30d = seriesOf { it.caloriesBurned?.toFloat() }
-            ),
-            DashboardRowItem(
-                id = "efficiency",
-                title = "Sleep Efficiency",
-                currentValue = "$effVal%",
-                deltaSymbol = "vs 90% baseline",
-                baselineText = "30d baseline",
-                isPositive = effVal >= 85,
-                unit = "%",
-                series30d = seriesOf { it.sleepEfficiencyPct?.toFloat() }
-            ),
-            DashboardRowItem(
-                id = "consistency",
-                title = "Sleep Consistency",
-                currentValue = "$consVal%",
-                deltaSymbol = "vs ${baselines.sleepConsistency6mPct.toInt()}% baseline",
-                baselineText = "6m baseline",
-                isPositive = consVal >= 60,
-                unit = "%",
-                series30d = seriesOf { it.sleepConsistencyPct?.toFloat() }
-            ),
-            DashboardRowItem(
-                id = "debt",
-                title = "Sleep Debt",
-                currentValue = "${debtMin / 60}h ${debtMin % 60}m",
-                deltaSymbol = "Need ${(latest?.sleepNeedMinutes ?: 617) / 60}h ${(latest?.sleepNeedMinutes ?: 617) % 60}m",
-                baselineText = "Tonight's target",
-                isPositive = debtMin <= 60,
-                unit = "min",
-                series30d = seriesOf { it.sleepDebtMinutes?.toFloat() }
-            )
-        )
-    }
-
-    val thirtyDaySeries = remember(cycles) {
-        cycles.take(30).reversed().mapIndexed { idx, c ->
-            val label = c.cycleStartTime.take(10).takeLast(5)
-            val valInt = c.recoveryScorePct ?: 55
-            (if (label.isNotBlank()) label else "D${idx + 1}") to valInt
-        }.ifEmpty {
-            listOf("11-12" to 39, "11-13" to 68, "11-14" to 53, "11-15" to 55)
-        }
-    }
-
-    var showStockNoop by remember { mutableStateOf(false) }
+    var showStockBleUtility by remember { mutableStateOf(false) }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        if (showStockNoop) {
+        if (showStockBleUtility) {
             AppRoot(viewModel = appViewModel)
             Surface(
                 color = Color(0xFF13171D).copy(alpha = 0.95f),
@@ -1307,7 +1176,7 @@ fun NoopRoot() {
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .padding(top = 48.dp, end = 16.dp)
-                    .clickable { showStockNoop = false },
+                    .clickable { showStockBleUtility = false },
             ) {
                 Text(
                     text = "← Back to WHOOP UI",
@@ -1319,22 +1188,12 @@ fun NoopRoot() {
             }
         } else {
             WhoopStyleHomeScreen(
-                sleepPerformancePct = latest?.sleepPerformancePct ?: 80,
-                recoveryPct = latest?.recoveryScorePct ?: 55,
-                dayStrain = prevStrainCycle?.dayStrain ?: 18.8,
-                liveHrBpm = (latest?.rhrBpm ?: 51.0).toInt(),
-                batteryPct = 44,
-                streakDays = cycles.size.coerceAtLeast(baselines.totalHistoricalCycles),
-                dashboardRows = dashboardRows,
-                thirtyDaySteps = thirtyDaySeries,
-                cycles = cycles,
-                workouts = workouts,
-                baselines = baselines,
+                appViewModel = appViewModel,
                 onOpenMetricDetail = { target ->
                     if (target == "BLE_SETTINGS") {
-                        showStockNoop = true
+                        showStockBleUtility = true
                     }
-                },
+                }
             )
         }
     }

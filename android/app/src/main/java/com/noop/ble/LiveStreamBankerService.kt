@@ -1,6 +1,8 @@
 package com.noop.ble
 
 import android.Manifest
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -9,7 +11,14 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import com.noop.NoopApplication
+import com.noop.R
+import com.noop.data.HrRow
+import com.noop.data.RrRow
+import com.noop.data.StreamBatch
+import com.noop.protocol.RrSourceChannel
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 
@@ -39,22 +48,34 @@ class LiveStreamBankerService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            // In production, pass Notification built via NotificationCompat.Builder
-            // with ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-            val fgsType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-            } else {
-                0
-            }
-            // startForeground(NOTIFICATION_ID, notification, fgsType)
+        val channelId = "noop_live_banker"
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && nm != null) {
+            val ch = NotificationChannel(
+                channelId,
+                "WHOOP Live Stream Banker",
+                NotificationManager.IMPORTANCE_LOW,
+            )
+            nm.createNotificationChannel(ch)
+        }
+        val notification = NotificationCompat.Builder(this, channelId)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("WHOOP 5.0 Live Stream Active")
+            .setContentText("Banking live heart rate and R-R intervals to local SQLite")
+            .setOngoing(true)
+            .build()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(4201, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+        } else {
+            startForeground(4201, notification)
         }
         return START_STICKY
     }
 
     /**
      * Called from BluetoothGattCallback.onCharacteristicChanged(gatt, characteristic, value) (API 33+).
-     *Copies payload off the binder thread immediately without blocking.
+     * Copies payload off the binder thread immediately without blocking.
      */
     fun onRaw2A37Notification(nowEpochSec: Long, value: ByteArray) {
         packetQueue.trySend(nowEpochSec to value.copyOf())
@@ -74,7 +95,7 @@ class LiveStreamBankerService : Service() {
         }
     }
 
-    private fun flushBatchWithBoundedWakeLock(
+    private suspend fun flushBatchWithBoundedWakeLock(
         batch: List<Pair<Long, Whoop5Fw5043Patch.Parsed2A37Packet>>
     ) {
         if (batch.isEmpty()) return
@@ -84,7 +105,24 @@ class LiveStreamBankerService : Service() {
             acquire(5_000L) // Bounded 5-second timeout per batch write (QA Rule 3.6)
         }
         try {
-            // Insert into SQLite (WAL mode): hrSample(deviceId, ts, bpm) and rrInterval(deviceId, ts, slot, rrMs)
+            val noopApp = application as? NoopApplication ?: return
+            val repo = noopApp.repository
+            val devId = noopApp.activeDeviceId.ifBlank { WhoopBleClient.DEFAULT_DEVICE_ID }
+            val hrRows = ArrayList<HrRow>(batch.size)
+            val rrRows = ArrayList<RrRow>(batch.size * 2)
+            for ((tsSec, pkt) in batch) {
+                if (pkt.hrBpm in 30..220) {
+                    hrRows.add(HrRow(ts = tsSec, bpm = pkt.hrBpm))
+                }
+                for (rrMs in pkt.rrIntervalsMs) {
+                    if (rrMs in 250..3000) {
+                        rrRows.add(RrRow(ts = tsSec, rrMs = rrMs, srcChannel = RrSourceChannel.WHOOP5_STANDARD))
+                    }
+                }
+            }
+            if (hrRows.isNotEmpty() || rrRows.isNotEmpty()) {
+                repo.insert(StreamBatch(hr = hrRows, rr = rrRows), devId)
+            }
         } finally {
             if (wakeLock?.isHeld == true) {
                 wakeLock.release()

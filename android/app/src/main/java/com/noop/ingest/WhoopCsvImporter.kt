@@ -105,6 +105,46 @@ object WhoopCsvImporter {
             )
         }
 
+        if (truncated) {
+            // #70: never silently truncate. If the aggregate RAM budget tripped, the retained CSV set was
+            // partial — say so plainly instead of reporting a clean import over incomplete data.
+        }
+
+        return importFromMap(csvData, truncated, repo, deviceId)
+    }
+
+    /**
+     * Auto-seeds NOOP's local Room database (`dailyMetric`, `sleepSession`, `workout`, `journalEntry`,
+     * `metricSeries`) directly from bundled WHOOP CSV exports in `assets/whoop_export/`.
+     */
+    suspend fun importBundledAssets(
+        context: Context,
+        repo: WhoopRepository,
+        assetFolder: String = "whoop_export",
+        deviceId: String = WHOOP_DEVICE,
+    ): ImportSummary {
+        val wanted = listOf(CYCLES_NAME, SLEEPS_NAME, WORKOUTS_NAME, JOURNAL_NAME)
+        val csvData = LinkedHashMap<String, ByteArray>()
+        for (name in wanted) {
+            val bytes = runCatching {
+                context.assets.open("$assetFolder/$name").use { it.readAllCapped(MAX_ENTRY_BYTES) }
+            }.getOrNull()
+            if (bytes != null && bytes.isNotEmpty()) {
+                csvData[name] = bytes
+            }
+        }
+        if (csvData.isEmpty()) {
+            return ImportSummary.failure(SOURCE_LABEL, "No bundled WHOOP CSVs found in assets/$assetFolder.")
+        }
+        return importFromMap(csvData, truncated = false, repo = repo, deviceId = deviceId)
+    }
+
+    private suspend fun importFromMap(
+        csvData: Map<String, ByteArray>,
+        truncated: Boolean,
+        repo: WhoopRepository,
+        deviceId: String = WHOOP_DEVICE,
+    ): ImportSummary {
         val cycles = csvData[CYCLES_NAME]?.let { parseCycles(CsvTable.fromData(it), deviceId) } ?: emptyList()
         val cycleSeries = csvData[CYCLES_NAME]?.let { parseCycleSeries(CsvTable.fromData(it), deviceId) } ?: emptyList()
         val sleepParse = csvData[SLEEPS_NAME]?.let { parseSleeps(CsvTable.fromData(it), deviceId) }

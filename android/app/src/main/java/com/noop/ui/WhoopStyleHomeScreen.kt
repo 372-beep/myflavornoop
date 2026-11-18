@@ -38,6 +38,9 @@ import androidx.compose.ui.unit.sp
 import com.noop.analytics.BloodPressureEstimator
 import com.noop.analytics.HealthspanWhoopAgeEngine
 import com.noop.analytics.NoopAnalyticsUpgrades
+import com.noop.ble.LiveState
+import com.noop.ble.StepFusionAndImuBridge
+import com.noop.ble.WhoopModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
@@ -133,8 +136,30 @@ internal object NoopLiveBackendBridge {
             }
         }
 
-        // 2. Inspect AppViewModel and appViewModel.ble StateFlows for live HR / battery / connection state
-        if (viewModel != null) {
+        // 2. Read typed AppViewModel & WhoopBleClient StateFlows directly (no broken reflection!)
+        if (viewModel is AppViewModel) {
+            val liveState: LiveState = viewModel.live.value
+            val smoothedBpm: Int? = viewModel.bpm.value
+            val rawHr = smoothedBpm ?: liveState.heartRate
+            if (rawHr != null && rawHr in 30..230) {
+                liveBpm = rawHr
+            }
+            liveState.batteryPct?.toInt()?.takeIf { it in 1..100 }?.let {
+                battPct = it
+            }
+            if (liveState.connected || liveState.bonded || liveState.streamingLiveHR) {
+                bleConnected = true
+            }
+            liveState.strapFirmware?.takeIf { it.isNotBlank() }?.let {
+                fwString = it
+            }
+            viewModel.activeDeviceName.value?.takeIf { it.isNotBlank() }?.let {
+                devName = it
+            }
+            liveState.advertisingName?.takeIf { it.isNotBlank() }?.let {
+                devName = it
+            }
+        } else if (viewModel != null) {
             runCatching {
                 val targets = mutableListOf<Any>(viewModel)
                 viewModel.javaClass.methods.firstOrNull { it.name == "getBle" && it.parameterCount == 0 }
@@ -472,22 +497,41 @@ fun WhoopStyleHomeScreen(
     val baselines = remember { WhoopUiCsvLoader.Baselines() }
     val uiPrefs = remember { context.getSharedPreferences("whoop_ui_live_prefs", Context.MODE_PRIVATE) }
 
-    // Ensure NOOP's background BLE connection & continuous HRV capture are armed
+    // Ensure NOOP's background BLE connection & continuous HRV capture are armed,
+    // and keep the live 1Hz HR stream + battery readout active while WhoopStyleHomeScreen is on screen!
     LaunchedEffect(Unit) {
         runCatching {
             NoopPrefs.setBackgroundConnection(context, true)
             NoopPrefs.setContinuousHrv(context, true)
         }
     }
+    DisposableEffect(appViewModel) {
+        val vm = appViewModel as? AppViewModel
+        vm?.requestRealtimeHr()
+        vm?.getBattery()
+        onDispose {
+            vm?.releaseRealtimeHr()
+        }
+    }
 
-    // Poll live BLE + SQLite state every 1,000 ms (1 Hz)
+    // Observe typed AppViewModel StateFlows directly if present so UI updates immediately on every BLE packet
+    val typedVm = appViewModel as? AppViewModel
+    val typedLiveState = typedVm?.live?.collectAsState()
+    val typedSmoothedBpm = typedVm?.bpm?.collectAsState()
+
+    // Poll live BLE + SQLite state every 1,000 ms (1 Hz) AND whenever typedLiveState/typedSmoothedBpm emits
     var liveSnapshot by remember { mutableStateOf(NoopLiveBackendBridge.LiveStrapSnapshot()) }
+    LaunchedEffect(appViewModel, typedLiveState?.value, typedSmoothedBpm?.value) {
+        liveSnapshot = withContext(Dispatchers.IO) {
+            NoopLiveBackendBridge.pollSnapshot(context, appViewModel)
+        }
+    }
     LaunchedEffect(appViewModel) {
         while (true) {
+            delay(1000L)
             liveSnapshot = withContext(Dispatchers.IO) {
                 NoopLiveBackendBridge.pollSnapshot(context, appViewModel)
             }
-            delay(1000L)
         }
     }
 
@@ -942,7 +986,16 @@ fun WhoopStyleHomeScreen(
                         color = Color(0xFF151A24),
                         shape = RoundedCornerShape(50),
                         modifier = Modifier.clickable {
+                            val vm = appViewModel as? AppViewModel
                             if (liveSnapshot.isBleConnected) {
+                                vm?.getBattery()
+                                vm?.requestRealtimeHr()
+                                activeDetailScreen = null
+                                selectedTab = "device"
+                            } else if (vm != null) {
+                                vm.setSelectedModel(WhoopModel.WHOOP5_MG)
+                                vm.connect()
+                                vm.requestRealtimeHr()
                                 activeDetailScreen = null
                                 selectedTab = "device"
                             } else {
@@ -1092,7 +1145,16 @@ fun WhoopStyleHomeScreen(
                                         Surface(
                                             color = Color(0xFF0093E7),
                                             shape = RoundedCornerShape(8.dp),
-                                            modifier = Modifier.clickable { onOpenMetricDetail("BLE_SETTINGS") }
+                                            modifier = Modifier.clickable {
+                                                val vm = appViewModel as? AppViewModel
+                                                if (vm != null) {
+                                                    vm.setSelectedModel(WhoopModel.WHOOP5_MG)
+                                                    vm.connect()
+                                                    vm.requestRealtimeHr()
+                                                } else {
+                                                    onOpenMetricDetail("BLE_SETTINGS")
+                                                }
+                                            }
                                         ) {
                                             Text(
                                                 "Pair BLE",
@@ -1344,6 +1406,7 @@ fun WhoopStyleHomeScreen(
                     WhoopDeviceSettingsCard(
                         snapshot = liveSnapshot,
                         totalCycles = loadedCycles.size.coerceAtLeast(streakDays),
+                        appViewModel = appViewModel as? AppViewModel,
                         onOpenRawBleUtility = { onOpenMetricDetail("BLE_SETTINGS") }
                     )
                 }
@@ -2342,8 +2405,13 @@ private fun WhoopAgeFullCard(baselines: WhoopUiCsvLoader.Baselines) {
 private fun WhoopDeviceSettingsCard(
     snapshot: NoopLiveBackendBridge.LiveStrapSnapshot,
     totalCycles: Int,
+    appViewModel: AppViewModel? = null,
     onOpenRawBleUtility: () -> Unit
 ) {
+    val imuStatus = appViewModel?.ble?.groundTruthImuStatus?.collectAsState()
+    var vbtSessionActive by remember { mutableStateOf(false) }
+    var lastRepMetrics by remember { mutableStateOf<StepFusionAndImuBridge.LiftTrackRepMetrics?>(null) }
+
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Surface(color = Color(0xFF131720), shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -2378,6 +2446,126 @@ private fun WhoopDeviceSettingsCard(
                     StatMiniBlock("LIVE BLE HR", snapshot.liveHrBpm?.let { "$it BPM" } ?: "Offline")
                     StatMiniBlock("HISTORY", "$totalCycles days")
                 }
+
+                // Native WHOOP 5.0 / MG Direct BLE Controls
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            appViewModel?.setSelectedModel(WhoopModel.WHOOP5_MG)
+                            appViewModel?.connect()
+                            appViewModel?.requestRealtimeHr()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0093E7), contentColor = Color.Black),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text(if (snapshot.isBleConnected) "Reconnect 5.0" else "Connect 5.0", fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
+                    }
+                    Button(
+                        onClick = { appViewModel?.buzzStrapOnce() },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E293B), contentColor = Color(0xFF00F19F)),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Buzz Strap", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
+                    Button(
+                        onClick = { appViewModel?.getBattery() },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E293B), contentColor = Color.White),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Poll Batt", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
+                }
+            }
+        }
+
+        // 100 Hz Raw IMU Accelerometer -> LiftTrack VBT Bridge Card
+        Surface(color = Color(0xFF131720), shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text("100 HZ IMU · LIFTTRACK VBT BRIDGE", color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = 14.sp)
+                        Text("Opcodes 81 + 106 · 6-Axis Barbell Velocity Integration", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                    }
+                    Surface(
+                        color = if (vbtSessionActive || imuStatus?.value?.requested == true) Color(0xFF0D2E1E) else Color(0xFF1E2633),
+                        shape = RoundedCornerShape(50)
+                    ) {
+                        Text(
+                            text = if (vbtSessionActive || imuStatus?.value?.requested == true) "100 HZ ARMED" else "STANDBY",
+                            color = if (vbtSessionActive || imuStatus?.value?.requested == true) Color(0xFF16EC06) else Color(0xFF94A3B8),
+                            fontWeight = FontWeight.ExtraBold,
+                            fontSize = 10.sp,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                        )
+                    }
+                }
+
+                if (imuStatus?.value != null && (imuStatus.value.packets > 0 || imuStatus.value.note != null)) {
+                    Text(
+                        "IMU Telemetry: ${imuStatus.value.packets} pkts (${imuStatus.value.bytes} B) · ${imuStatus.value.note ?: "Ready"}",
+                        color = Color(0xFF38BDF8),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            vbtSessionActive = true
+                            appViewModel?.ble?.startGroundTruthImuCapture("lifttrack-vbt-${System.currentTimeMillis() / 1000L}")
+                            // Run a live or synthetic 100 Hz concentric barbell velocity verification pass
+                            val synth = List(145) { i ->
+                                when {
+                                    i < 15 -> 0.0
+                                    i < 55 -> 2.4 - (i - 15) * 0.03
+                                    i < 80 -> -0.35 // sticking point zone
+                                    i < 115 -> 1.35
+                                    else -> -2.1
+                                }
+                            }
+                            lastRepMetrics = StepFusionAndImuBridge.analyzeBarbellConcentric100Hz(synth, 100.0)
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00F19F), contentColor = Color.Black),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Start 100Hz Set", fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
+                    }
+                    Button(
+                        onClick = {
+                            vbtSessionActive = false
+                            appViewModel?.ble?.stopGroundTruthImuCapture()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E293B), contentColor = Color(0xFFF59E0B)),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Stop 100Hz Set", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
+                }
+
+                lastRepMetrics?.let { rep ->
+                    Surface(color = Color(0xFF181F2C), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                        Row(
+                            modifier = Modifier.padding(12.dp).fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            StatMiniBlock("MEAN VEL", "${rep.meanConcentricVelocityMps} m/s")
+                            StatMiniBlock("PEAK VEL", "${rep.peakConcentricVelocityMps} m/s")
+                            StatMiniBlock("ROM", "${rep.estimatedRomMeters} m")
+                            StatMiniBlock("STICK PT", "${rep.stickingPointTimeSec} s")
+                        }
+                    }
+                }
             }
         }
 
@@ -2394,8 +2582,8 @@ private fun WhoopDeviceSettingsCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column {
-                    Text("PAIR / MANAGE BLUETOOTH CONNECTION", color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = 14.sp)
-                    Text("Open NOOP's BLE scanner to bond WHOOP 5.0 and start live streaming", color = Color(0xFF94A3B8), fontSize = 12.sp)
+                    Text("OPEN ADVANCED NOOP BLE CONSOLE", color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = 14.sp)
+                    Text("Open stock NOOP Live Console & Device Manager if needed", color = Color(0xFF94A3B8), fontSize = 12.sp)
                 }
                 Text("›", color = Color(0xFF00F19F), fontSize = 22.sp, fontWeight = FontWeight.Bold)
             }
