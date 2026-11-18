@@ -1,0 +1,38 @@
+name: Build Custom NOOP WHOOP APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+        working-directory: ./android
+
+      - name: Run Custom NOOP Unit Tests
+        run: ./gradlew testFullDebugUnitTest --tests "com.noop.analytics.NoopAnalyticsTest"
+        working-directory: ./android
+
+      - name: Build Debug APK
+        run: ./gradlew assembleFullDebug
+        working-directory: ./android
+
+      - name: Upload Compiled NOOP APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NOOP-Custom-WHOOP-Debug-APK
+          path: android/app/build/outputs/apk/full/debug/*.apk
