@@ -1,0 +1,64 @@
+name: Sync Upstream (ryanbr/noop)
+
+on:
+  schedule:
+    - cron: '15 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+
+      - name: Mirror ryanbr/noop:main into upstream-main
+        id: mirror
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/ryanbr/noop.git
+          git fetch upstream main
+          if ! git push origin refs/remotes/upstream/main:refs/heads/upstream-main --force; then
+            echo "::error::Failed to push upstream-main. If ryanbr/noop modified a file under .github/workflows/, add a PAT with repo+workflow scopes as repository secret UPSTREAM_SYNC_TOKEN."
+            exit 1
+          fi
+          AHEAD=$(git rev-list --count origin/main..refs/remotes/upstream/main)
+          echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
+          echo "Upstream ryanbr/noop:main is $AHEAD commit(s) ahead of main."
+
+      - name: Open or update sync PR (upstream-main -> main)
+        if: steps.mirror.outputs.ahead != '0'
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          EXISTING=$(gh pr list --repo "$GITHUB_REPOSITORY" --base main --head upstream-main --state open --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            echo "Sync PR #$EXISTING is already open and has been refreshed with the latest upstream-main commits."
+            exit 0
+          fi
+          DATE=$(date -u +%Y-%m-%d)
+          COUNT="${{ steps.mirror.outputs.ahead }}"
+          LOG=$(git log --no-merges --oneline origin/main..refs/remotes/upstream/main | head -n 30)
+          BODY=$(printf "Automated sync from \`ryanbr/noop:main\` (**%s** new commit(s)).\n\n### Recent upstream commits\n\`\`\`\n%s\n\`\`\`\n\nWait for the APK build & unit-test checks to pass before merging." "$COUNT" "$LOG")
+          if ! gh pr create --repo "$GITHUB_REPOSITORY" --base main --head upstream-main \
+            --title "Sync upstream ryanbr/noop (${DATE})" \
+            --body "$BODY"; then
+            echo "::error::Could not open sync PR. Enable 'Allow GitHub Actions to create and approve pull requests' under Settings -> Actions -> General -> Workflow permissions (or set secret UPSTREAM_SYNC_TOKEN)."
+            exit 1
+          fi

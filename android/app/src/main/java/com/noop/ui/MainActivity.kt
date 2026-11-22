@@ -9,14 +9,11 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -29,16 +26,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.view.WindowCompat
@@ -48,11 +41,9 @@ import com.noop.BuildConfig
 import com.noop.CrashCapture
 import com.noop.NoopApplication
 import com.noop.R
-import com.noop.analytics.WhoopCsvHistoricalImporter
 import com.noop.ble.WhoopModel
 import com.noop.data.DemoSeeder
 import com.noop.data.WhoopRepository
-import com.noop.ingest.WhoopCsvImporter
 import com.noop.push.SelfHostedPushScheduler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
@@ -60,7 +51,6 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 /**
  * Single-activity host. Requests the runtime BLE permissions the strap connection
@@ -107,9 +97,7 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Auto-complete first-time setup with Alex's personal profile, WHOOP 5.0 / MG defaults,
-        // and one-shot Room database seeding from bundled assets/whoop_export/ CSVs.
-        ensureAlexDefaultsAndSeedHistory()
+        MyFlavorBootstrap.apply(this, lifecycleScope)
         requestBlePermissions()
 
         runCatching { DebugExportScheduler.reschedule(applicationContext) }
@@ -151,49 +139,6 @@ class MainActivity : ComponentActivity() {
         }.toTypedArray()
 
         if (needed.isNotEmpty()) permissionLauncher.launch(needed)
-    }
-
-    /**
-     * Pre-populates Alex's personal profile, accepts terms/onboarding automatically so fresh APK
-     * installs never force a 12-page wizard, defaults the BLE scanner to WHOOP 5.0 / MG, and seeds
-     * the bundled 636-day WHOOP CSV export into Room SQLite once.
-     */
-    private fun ensureAlexDefaultsAndSeedHistory() {
-        val prefs = NoopPrefs.of(this)
-        if (!prefs.getBoolean(NoopPrefs.KEY_ONBOARDED, false) ||
-            prefs.getString(NoopPrefs.KEY_ACCEPTED_TERMS_VERSION, "") != Terms.CURRENT_VERSION
-        ) {
-            prefs.edit()
-                .putString(NoopPrefs.KEY_ACCEPTED_TERMS_VERSION, Terms.CURRENT_VERSION)
-                .putString(NoopPrefs.KEY_ACCEPTED_TERMS_AT, java.time.Instant.now().toString())
-                .putBoolean(NoopPrefs.KEY_ONBOARDED, true)
-                .putString(NoopPrefs.KEY_LAST_SEEN_CHANGELOG, AppChangelog.CURRENT_VERSION)
-                .putBoolean(NoopPrefs.KEY_BACKGROUND_CONNECTION, true)
-                .putBoolean(NoopPrefs.KEY_CONTINUOUS_HRV, true)
-                .putString("noop.selectedWhoopModel", WhoopModel.WHOOP5_MG.name)
-                .apply()
-
-            runCatching {
-                val profile = ProfileStore.from(applicationContext)
-                profile.setAge(30)
-                profile.sex = "male"
-                profile.hrMaxOverride = 203
-            }
-        } else if (!prefs.contains("noop.selectedWhoopModel")) {
-            prefs.edit().putString("noop.selectedWhoopModel", WhoopModel.WHOOP5_MG.name).apply()
-        }
-
-        if (!prefs.getBoolean("noop.bundledCsvSeeded.v1", false)) {
-            lifecycleScope.launch(Dispatchers.IO) {
-                runCatching {
-                    val repo = (application as NoopApplication).repository
-                    val summary = WhoopCsvImporter.importBundledAssets(applicationContext, repo)
-                    if (summary.counts.isNotEmpty()) {
-                        prefs.edit().putBoolean("noop.bundledCsvSeeded.v1", true).apply()
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -1101,7 +1046,7 @@ object NoopPrefs {
 }
 
 /**
- * Root gate around [WhoopStyleHomeScreen] + [AppRoot].
+ * Root gate around [AppRoot].
  */
 @Composable
 fun NoopRoot() {
@@ -1165,38 +1110,7 @@ fun NoopRoot() {
         return
     }
 
-    var showStockBleUtility by remember { mutableStateOf(false) }
-
-    Box(modifier = Modifier.fillMaxSize()) {
-        if (showStockBleUtility) {
-            AppRoot(viewModel = appViewModel)
-            Surface(
-                color = Color(0xFF13171D).copy(alpha = 0.95f),
-                shape = RoundedCornerShape(50),
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(top = 48.dp, end = 16.dp)
-                    .clickable { showStockBleUtility = false },
-            ) {
-                Text(
-                    text = "← Back to WHOOP UI",
-                    color = Color(0xFF00F19F),
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-                )
-            }
-        } else {
-            WhoopStyleHomeScreen(
-                appViewModel = appViewModel,
-                onOpenMetricDetail = { target ->
-                    if (target == "BLE_SETTINGS") {
-                        showStockBleUtility = true
-                    }
-                }
-            )
-        }
-    }
+    AppRoot(viewModel = appViewModel)
 
     if (lastSeenChangelog != AppChangelog.CURRENT_VERSION) {
         Dialog(
